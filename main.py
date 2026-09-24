@@ -122,7 +122,7 @@ async def process_all_messages(message: Message):
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO stats (chat_id, user_id, username, full_name, msg_count)
+        INSERT INTO stats (chat_id, user_id, username, first_name, msg_count)
         VALUES (?, ?, ?, ?, 1)
         ON CONFLICT(chat_id, user_id) DO UPDATE SET
             msg_count = msg_count + 1,
