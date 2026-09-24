@@ -132,7 +132,7 @@ async def process_all_messages(message: Message):
         message.chat.id,
         message.from_user.id,
         message.from_user.username,
-        message.from_user.firsta_name
+        message.from_user.first_name
     ))
     conn.commit()
 
