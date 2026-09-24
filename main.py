@@ -1,44 +1,49 @@
-import os
-import re
 import asyncio
 import logging
+import re
 import sqlite3
+import os
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import ChatPermissions, Message
-from aiogram.enums import ChatMemberStatus
 
-load_dotenv()
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-bot = Bot(token=TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-
+# Инициализация базы данных SQLite
 def init_db():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
+    
+    # Таблица активности пользователей
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS stats (
+        CREATE TABLE IF NOT EXISTS user_activity (
             chat_id INTEGER,
             user_id INTEGER,
             username TEXT,
             first_name TEXT,
-            msg_count INTEGER DEFAULT 0,
+            message_count INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
         )
     """)
+    
+    # Таблица варнов (предупреждений)
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS warns (
+        CREATE TABLE IF NOT EXISTS warn_system (
             chat_id INTEGER,
             user_id INTEGER,
             warn_count INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
         )
     """)
+    
+    # Таблица кастомных РП-команд
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS custom_commands (
             chat_id INTEGER,
@@ -47,161 +52,228 @@ def init_db():
             PRIMARY KEY (chat_id, command_name)
         )
     """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS system_state (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
+    
     conn.commit()
     conn.close()
-
 
 init_db()
 
 
+# Проверка, является ли пользователь администратором
 async def is_admin(message: Message) -> bool:
     if message.chat.type in ["private"]:
         return False
     member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
-    return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
+    return member.status in ["administrator", "creator"]
 
 
-def check_reset_weekly():
-    conn = sqlite3.connect("bot_database.db")
-    cursor = conn.cursor()
-    today = datetime.now()
-    current_week = f"{today.year}-{today.isocalendar()[1]}"
-
-    cursor.execute("SELECT value FROM system_state WHERE key = 'last_week'")
-    row = cursor.fetchone()
-
-    if not row:
-        cursor.execute("INSERT INTO system_state (key, value) VALUES ('last_week', ?)", (current_week,))
-        conn.commit()
-    elif row[0] != current_week:
-        cursor.execute("UPDATE stats SET msg_count = 0")
-        cursor.execute("UPDATE system_state SET value = ? WHERE key = 'last_week'", (current_week,))
-        conn.commit()
-
-    conn.close()
-
-
-async def scheduler():
-    while True:
-        check_reset_weekly()
-        await asyncio.sleep(3600)
-
-
-def parse_time(time_str: str) -> tuple[int, str]:
+# Вспомогательная функция для парсинга времени мута
+def parse_time(time_str: str):
     if not time_str:
         return 60, "60 мин."
-
-    match = re.match(r"^(\d+)\s*([a-zA-Zа-яА-Я]+)?$", time_str.strip())
+    
+    match = re.match(r"^(\d+)\s*(мин|мин.|минут|минуты|ч|час|часа|часов|д|ден|день|дня|дней)?$", time_str.lower().strip())
     if not match:
         return 60, "60 мин."
-
+    
     num = int(match.group(1))
-    unit = match.group(2).lower() if match.group(2) else "м"
-
-    if unit in ["с", "сек", "s", "sec"]:
-        return max(1, num // 60), f"{num} сек."
-    elif unit in ["м", "мин", "m", "min"]:
-        return num, f"{num} мин."
-    elif unit in ["ч", "час", "часов", "h", "hour"]:
-        return num * 60, f"{num} час."
-    elif unit in ["д", "день", "дней", "d", "day"]:
+    unit = match.group(2)
+    
+    if unit in ["ч", "час", "часа", "часов"]:
+        return num * 60, f"{num} ч."
+    elif unit in ["д", "ден", "день", "дня", "дней"]:
         return num * 1440, f"{num} дн."
-    elif unit in ["н", "неделя", "недель", "w", "week"]:
-        return num * 10080, f"{num} нед."
-    elif unit in ["мес", "месяц", "месяцев"]:
-        return num * 43200, f"{num} мес."
-
-    return num, f"{num} мин."
+    else:
+        return num, f"{num} мин."
 
 
+# === ДОБАВЛЕНИЕ КАСТОМНЫХ РП-КОМАНД ===
+@dp.message(F.text.startswith("+комманда") | F.text.startswith("+команда"))
+async def add_custom_command(message: Message):
+    if not await is_admin(message):
+        return
+    
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        await message.answer(
+            "Использование: `+команда [название] [текст ответа]`\n\n"
+            "**Доступные переменные:**\n"
+            "• `{Username}` — имя отправителя\n"
+            "• `{Reply}` — имя того, кому ответили\n"
+            "• `{Reply_message}` — текст исходного сообщения", 
+            parse_mode="Markdown"
+        )
+        return
+    
+    cmd_name = parts[1].lower()
+    response_text = parts[2]
+    
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO custom_commands (chat_id, command_name, response_text)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id, command_name) DO UPDATE SET response_text = excluded.response_text
+    """, (message.chat.id, cmd_name, response_text))
+    conn.commit()
+    conn.close()
+    
+    await message.answer(f"✅ Команда `{cmd_name}` успешно сохранена!", parse_mode="Markdown")
+
+
+# === УДАЛЕНИЕ КАСТОМНЫХ РП-КОМАНД ===
+@dp.message(F.text.startswith("-комманда") | F.text.startswith("-команда"))
+async def delete_custom_command(message: Message):
+    if not await is_admin(message):
+        return
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: `-команда [название]`", parse_mode="Markdown")
+        return
+    
+    cmd_name = parts[1].lower().strip()
+    
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM custom_commands WHERE chat_id = ? AND command_name = ?",
+        (message.chat.id, cmd_name)
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    
+    if deleted > 0:
+        await message.answer(f"🗑 Команда `{cmd_name}` удалена!", parse_mode="Markdown")
+    else:
+        await message.answer(f"⚠️ Команда `{cmd_name}` не найдена.", parse_mode="Markdown")
+
+
+# === СПИСОК ВСЕХ КАСТОМНЫХ РП-КОМАНД ===
+@dp.message(F.text.lower().in_(["список команд", "команды", "рп команды"]))
+async def list_custom_commands(message: Message):
+    if message.chat.type in ["private"]:
+        return
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT command_name FROM custom_commands WHERE chat_id = ? ORDER BY command_name ASC",
+        (message.chat.id,)
+    )
+    commands = cursor.fetchall()
+    conn.close()
+
+    if not commands:
+        await message.answer("📝 В этом чате пока нет созданных кастомных команд.")
+        return
+
+    cmd_list = "\n".join([f"• `{cmd[0]}`" for cmd in commands])
+    await message.answer(
+        f"📜 **Список кастомных РП-команд чата:**\n\n{cmd_list}",
+        parse_mode="Markdown"
+    )
+
+
+# === ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ И КОМАНД ===
 @dp.message(F.text)
 async def process_all_messages(message: Message):
     if message.chat.type in ["private"]:
         return
 
-    check_reset_weekly()
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    text = message.text.lower().strip()
 
+    # 1. Обновляем статистику сообщений пользователя
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
-
-    # Сохраняем/обновляем счетчик активностей
     cursor.execute("""
-        INSERT INTO stats (chat_id, user_id, username, first_name, msg_count)
+        INSERT INTO user_activity (chat_id, user_id, username, first_name, message_count)
         VALUES (?, ?, ?, ?, 1)
         ON CONFLICT(chat_id, user_id) DO UPDATE SET
-            msg_count = msg_count + 1,
+            message_count = message_count + 1,
             username = excluded.username,
             first_name = excluded.first_name
-    """, (
-        message.chat.id,
-        message.from_user.id,
-        message.from_user.username,
-        message.from_user.first_name
-    ))
+    """, (chat_id, user_id, message.from_user.username, message.from_user.first_name))
     conn.commit()
+    conn.close()
 
-    text = message.text.strip()
-    lower_text = text.lower()
-    sender_name = message.from_user.full_name
-
-    if lower_text in ["банка с джемом", "в банку"]:
-        if await is_admin(message) and message.reply_to_message:
-            target = message.reply_to_message.from_user
+    # 2. Модерация (только для админов)
+    if await is_admin(message):
+        
+        # БАН: "банка с джемом" или "в банку"
+        if text in ["банка с джемом", "в банку"] and message.reply_to_message:
+            target_user = message.reply_to_message.from_user
             try:
-                await message.chat.ban(user_id=target.id)
-                await message.answer(f"{sender_name} отправил(а) {target.first_name} в банку с джемом.")
+                await message.chat.ban(target_user.id)
+                await message.answer(f"🫙 Пользователь {target_user.first_name} отправлен в банку с джемом (забанен)!")
             except Exception as e:
-                await message.answer(f"Ошибка: {e}")
-        conn.close()
-        return
+                await message.answer(f"Не удалось забанить пользователя: {e}")
+            return
 
-    if lower_text == "дать плод всей боли":
-        if await is_admin(message) and message.reply_to_message:
-            target = message.reply_to_message.from_user
+        # РАЗБАН ПО USERNAME: "вытащить из банки @username"
+        elif text.startswith("вытащить из банки"):
+            parts = text.split()
+            if len(parts) > 3 and parts[3].startswith("@"):
+                target_username = parts[3].replace("@", "")
+                conn = sqlite3.connect("bot_database.db")
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT user_id FROM user_activity WHERE chat_id = ? AND LOWER(username) = ?",
+                    (chat_id, target_username.lower())
+                )
+                res = cursor.fetchone()
+                conn.close()
+                if res:
+                    try:
+                        await message.chat.unban(res[0])
+                        await message.answer(f"🔓 Пользователь @{target_username} вытащен из банки (разбанен)!")
+                    except Exception as e:
+                        await message.answer(f"Не удалось разбанить: {e}")
+                else:
+                    await message.answer("Пользователь не найден в базе данных.")
+            return
+
+        # МУТ НА 1 ДЕНЬ: "дать плод всей боли"
+        elif text == "дать плод всей боли" and message.reply_to_message:
+            target_user = message.reply_to_message.from_user
             until_date = datetime.now() + timedelta(days=1)
             try:
                 await message.chat.restrict(
-                    user_id=target.id,
+                    target_user.id,
                     permissions=ChatPermissions(can_send_messages=False),
                     until_date=until_date
                 )
-                await message.answer(f"{sender_name} напоил(а) клиновым сиропом {target.first_name}. Теперь он(а) не сможет говорить 1 дн.!")
+                await message.answer(f"🍎 {target_user.first_name} вкусил плод всей боли и замолк на 1 день.")
             except Exception as e:
-                await message.answer(f"Ошибка: {e}")
-        conn.close()
-        return
+                await message.answer(f"Не удалось выдать мут: {e}")
+            return
 
-    mute_match = re.match(r"^(напоить клиновым сиропом|напоить сиропом|клиновый сироп)(?:\s+(.*))?$", lower_text)
-    if mute_match:
-        if await is_admin(message) and message.reply_to_message:
-            target = message.reply_to_message.from_user
-            time_arg = mute_match.group(2)
-            minutes, time_str = parse_time(time_arg)
+        # НАСТРАИВАЕМЫЙ МУТ: "клиновый сироп [время]" / "напоить сиропом [время]"
+        elif (text.startswith("клиновый сироп") or text.startswith("напоить сиропом")) and message.reply_to_message:
+            target_user = message.reply_to_message.from_user
+            time_part = text.replace("клиновый сироп", "").replace("напоить сиропом", "").strip()
+            minutes, display_time = parse_time(time_part)
             until_date = datetime.now() + timedelta(minutes=minutes)
             try:
                 await message.chat.restrict(
-                    user_id=target.id,
+                    target_user.id,
                     permissions=ChatPermissions(can_send_messages=False),
                     until_date=until_date
                 )
-                await message.answer(f"{sender_name} напоил(а) клиновым сиропом {target.first_name}. Теперь он(а) не сможет говорить {time_str}!")
+                await message.answer(f"🍁 {target_user.first_name} напоен кленовым сиропом и молчит {display_time}.")
             except Exception as e:
-                await message.answer(f"Ошибка: {e}")
-        conn.close()
-        return
+                await message.answer(f"Не удалось выдать мут: {e}")
+            return
 
-    if lower_text == "дать воды":
-        if await is_admin(message) and message.reply_to_message:
-            target = message.reply_to_message.from_user
+        # СНЯТИЕ МУТА: "дать воды"
+        elif text == "дать воды" and message.reply_to_message:
+            target_user = message.reply_to_message.from_user
             try:
                 await message.chat.restrict(
-                    user_id=target.id,
+                    target_user.id,
                     permissions=ChatPermissions(
                         can_send_messages=True,
                         can_send_media_messages=True,
@@ -209,80 +281,108 @@ async def process_all_messages(message: Message):
                         can_add_web_page_previews=True
                     )
                 )
-                await message.answer(f"{target.first_name} дали воды, теперь он(а) может говорить. С возвращением!")
+                await message.answer(f"💧 {target_user.first_name} получил воды и снова может говорить!")
             except Exception as e:
-                await message.answer(f"Ошибка: {e}")
-        conn.close()
-        return
+                await message.answer(f"Не удалось снять мут: {e}")
+            return
 
-    unban_match = re.match(r"^вытащить из банки\s+(.+)$", lower_text)
-    if unban_match:
-        if await is_admin(message):
-            target_username = unban_match.group(1).lstrip("@")
-            cursor.execute("SELECT user_id, first_name FROM stats WHERE chat_id = ? AND LOWER(username) = ?", (message.chat.id, target_username.lower()))
-            row = cursor.fetchone()
-            if row:
-                target_id, target_name = row
+        # ВАРН: "варн" или "отругать"
+        elif text in ["варн", "отругать"] and message.reply_to_message:
+            target_user = message.reply_to_message.from_user
+            conn = sqlite3.connect("bot_database.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT warn_count FROM warn_system WHERE chat_id = ? AND user_id = ?",
+                (chat_id, target_user.id)
+            )
+            res = cursor.fetchone()
+            current_warns = (res[0] if res else 0) + 1
+
+            if current_warns >= 3:
+                cursor.execute(
+                    "DELETE FROM warn_system WHERE chat_id = ? AND user_id = ?",
+                    (chat_id, target_user.id)
+                )
+                conn.commit()
+                conn.close()
                 try:
-                    await message.chat.unban(user_id=target_id)
-                    await message.answer(f"{target_name} вытащили из банки с джемом. С возвращением!")
+                    await message.chat.ban(target_user.id)
+                    await message.answer(f"🫙 {target_user.first_name} получил [3/3] варнов и отправлен в банку с джемом!")
                 except Exception as e:
-                    await message.answer(f"Ошибка: {e}")
+                    await message.answer(f"Не удалось забанить за варны: {e}")
             else:
-                await message.answer("Пользователь не найден в базе чата.")
-        conn.close()
-        return
+                cursor.execute("""
+                    INSERT INTO warn_system (chat_id, user_id, warn_count)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id, user_id) DO UPDATE SET warn_count = excluded.warn_count
+                """, (chat_id, target_user.id, current_warns))
+                conn.commit()
+                conn.close()
+                await message.answer(f"⚠️ {target_user.first_name} получил предупреждение! [{current_warns}/3]")
+            return
 
-    warn_match = re.match(r"^(варн|отругать)(?:\s+(.*))?$", lower_text)
-    if warn_match:
-        if await is_admin(message) and message.reply_to_message:
-            target = message.reply_to_message.from_user
-            cursor.execute("INSERT INTO warns (chat_id, user_id, warn_count) VALUES (?, ?, 1) ON CONFLICT(chat_id, user_id) DO UPDATE SET warn_count = warn_count + 1", (message.chat.id, target.id))
-            conn.commit()
-            cursor.execute("SELECT warn_count FROM warns WHERE chat_id = ? AND user_id = ?", (message.chat.id, target.id))
-            warns = cursor.fetchone()[0]
-            await message.answer(f"{sender_name} отругал(а) {target.first_name}! [Варнов: {warns}/3]")
-            if warns >= 3:
-                try:
-                    await message.chat.ban(user_id=target.id)
-                    cursor.execute("UPDATE warns SET warn_count = 0 WHERE chat_id = ? AND user_id = ?", (message.chat.id, target.id))
-                    conn.commit()
-                    await message.answer(f"{target.full_name} набрал(а) 3 варна и отправляется в банку с джемом!")
-                except Exception as e:
-                    await message.answer(f"Ошибка: {e}")
-        conn.close()
-        return
+        # СТАТИСТИКА: "актив", "стата", "статистика"
+        elif text in ["актив", "стата", "статистика"]:
+            conn = sqlite3.connect("bot_database.db")
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT first_name, message_count FROM user_activity WHERE chat_id = ? ORDER BY message_count DESC LIMIT 20",
+                (chat_id,)
+            )
+            top_users = cursor.fetchall()
+            conn.close()
 
-    if lower_text in ["актив", "стата", "статистика"]:
-        if await is_admin(message):
-            cursor.execute("SELECT first_name, username, msg_count FROM stats WHERE chat_id = ? ORDER BY msg_count DESC LIMIT 20", (message.chat.id,))
-            rows = cursor.fetchall()
-            if not rows:
-                await message.answer("Статистика за эту неделю пока пуста.")
-            else:
-                text_res = "📊 **Статистика сообщений за неделю:**\n\n"
-                for idx, (first_name, username, count) in enumerate(rows, 1):
-                    user_str = f"@{username}" if username else first_name
-                    text_res += f"{idx}. {user_str} — {count} сообщ.\n"
-                await message.answer(text_res, parse_mode="Markdown")
-        conn.close()
-        return
+            if not top_users:
+                await message.answer("Статистика пока пуста.")
+                return
 
-    cmd_name = lower_text.split()[0]
-    cursor.execute("SELECT response_text FROM custom_commands WHERE chat_id = ? AND command_name = ?", (message.chat.id, cmd_name))
-    row = cursor.fetchone()
-    if row:
-        await message.answer(row[0])
+            stat_msg = "📊 **ТОП-20 самых активных участников:**\n\n"
+            for idx, (name, count) in enumerate(top_users, start=1):
+                stat_msg += f"{idx}. {name} — {count} сообщ.\n"
+            
+            await message.answer(stat_msg, parse_mode="Markdown")
+            return
 
+    # 3. Проверка кастомных РП-команд (доступно всем участникам)
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT response_text FROM custom_commands WHERE chat_id = ? AND command_name = ?",
+        (chat_id, text)
+    )
+    custom_cmd = cursor.fetchone()
     conn.close()
 
+    if custom_cmd:
+        template = custom_cmd[0]
+        
+        username = message.from_user.first_name if message.from_user else "Кто-то"
+        reply_user_name = "кого-то"
+        reply_msg_text = ""
+        
+        if message.reply_to_message:
+            if message.reply_to_message.from_user:
+                reply_user_name = message.reply_to_message.from_user.first_name
+            if message.reply_to_message.text:
+                reply_msg_text = message.reply_to_message.text
+            elif message.reply_to_message.caption:
+                reply_msg_text = message.reply_to_message.caption
 
+        formatted_response = template.format(
+            Username=username,
+            Reply=reply_user_name,
+            Reply_message=reply_msg_text
+        )
+        
+        await message.answer(formatted_response)
+        return
+
+
+# === ЗАПУСК БОТА ===
 async def main():
-    asyncio.create_task(scheduler())
+    logging.info("Бот запущен!")
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
-        
+                                                
