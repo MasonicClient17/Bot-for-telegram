@@ -1,20 +1,22 @@
-from dotenv import load_dotenv
-load_dotenv()
-
+import os
+import re
 import asyncio
 import logging
-import re
 import sqlite3
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import ChatPermissions, Message
 from aiogram.enums import ChatMemberStatus
-import os
+
+load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
+
 
 def init_db():
     conn = sqlite3.connect("bot_database.db")
@@ -24,7 +26,7 @@ def init_db():
             chat_id INTEGER,
             user_id INTEGER,
             username TEXT,
-            full_name TEXT,
+            first_name TEXT,
             msg_count INTEGER DEFAULT 0,
             PRIMARY KEY (chat_id, user_id)
         )
@@ -54,7 +56,9 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 init_db()
+
 
 async def is_admin(message: Message) -> bool:
     if message.chat.type in ["private"]:
@@ -62,15 +66,16 @@ async def is_admin(message: Message) -> bool:
     member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
     return member.status in [ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
 
+
 def check_reset_weekly():
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
     today = datetime.now()
     current_week = f"{today.year}-{today.isocalendar()[1]}"
-    
+
     cursor.execute("SELECT value FROM system_state WHERE key = 'last_week'")
     row = cursor.fetchone()
-    
+
     if not row:
         cursor.execute("INSERT INTO system_state (key, value) VALUES ('last_week', ?)", (current_week,))
         conn.commit()
@@ -78,25 +83,27 @@ def check_reset_weekly():
         cursor.execute("UPDATE stats SET msg_count = 0")
         cursor.execute("UPDATE system_state SET value = ? WHERE key = 'last_week'", (current_week,))
         conn.commit()
-    
+
     conn.close()
+
 
 async def scheduler():
     while True:
         check_reset_weekly()
         await asyncio.sleep(3600)
 
+
 def parse_time(time_str: str) -> tuple[int, str]:
     if not time_str:
         return 60, "60 мин."
-    
+
     match = re.match(r"^(\d+)\s*([a-zA-Zа-яА-Я]+)?$", time_str.strip())
     if not match:
         return 60, "60 мин."
-    
+
     num = int(match.group(1))
     unit = match.group(2).lower() if match.group(2) else "м"
-    
+
     if unit in ["с", "сек", "s", "sec"]:
         return max(1, num // 60), f"{num} сек."
     elif unit in ["м", "мин", "m", "min"]:
@@ -109,8 +116,9 @@ def parse_time(time_str: str) -> tuple[int, str]:
         return num * 10080, f"{num} нед."
     elif unit in ["мес", "месяц", "месяцев"]:
         return num * 43200, f"{num} мес."
-    
+
     return num, f"{num} мин."
+
 
 @dp.message(F.text)
 async def process_all_messages(message: Message):
@@ -121,6 +129,8 @@ async def process_all_messages(message: Message):
 
     conn = sqlite3.connect("bot_database.db")
     cursor = conn.cursor()
+
+    # Сохраняем/обновляем счетчик активностей
     cursor.execute("""
         INSERT INTO stats (chat_id, user_id, username, first_name, msg_count)
         VALUES (?, ?, ?, ?, 1)
@@ -245,14 +255,14 @@ async def process_all_messages(message: Message):
 
     if lower_text in ["актив", "стата", "статистика"]:
         if await is_admin(message):
-            cursor.execute("SELECT full_name, username, msg_count FROM stats WHERE chat_id = ? ORDER BY msg_count DESC LIMIT 20", (message.chat.id,))
+            cursor.execute("SELECT first_name, username, msg_count FROM stats WHERE chat_id = ? ORDER BY msg_count DESC LIMIT 20", (message.chat.id,))
             rows = cursor.fetchall()
             if not rows:
                 await message.answer("Статистика за эту неделю пока пуста.")
             else:
                 text_res = "📊 **Статистика сообщений за неделю:**\n\n"
-                for idx, (full_name, username, count) in enumerate(rows, 1):
-                    user_str = f"@{username}" if username else full_name
+                for idx, (first_name, username, count) in enumerate(rows, 1):
+                    user_str = f"@{username}" if username else first_name
                     text_res += f"{idx}. {user_str} — {count} сообщ.\n"
                 await message.answer(text_res, parse_mode="Markdown")
         conn.close()
@@ -266,10 +276,13 @@ async def process_all_messages(message: Message):
 
     conn.close()
 
+
 async def main():
     asyncio.create_task(scheduler())
     await dp.start_polling(bot)
 
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
+        ц
