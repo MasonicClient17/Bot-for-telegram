@@ -11,7 +11,7 @@ from aiogram.types import ChatPermissions, Message
 from aiogram.enums import ChatMemberStatus
 import os
 
-TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН_ОТ_BOTFATHER")
+TOKEN = os.getenv("BOT_TOKEN")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -127,12 +127,12 @@ async def process_all_messages(message: Message):
         ON CONFLICT(chat_id, user_id) DO UPDATE SET
             msg_count = msg_count + 1,
             username = excluded.username,
-            full_name = excluded.full_name
+            first_name = excluded.first_name
     """, (
         message.chat.id,
         message.from_user.id,
         message.from_user.username,
-        message.from_user.full_name
+        message.from_user.firsta_name
     ))
     conn.commit()
 
@@ -145,7 +145,7 @@ async def process_all_messages(message: Message):
             target = message.reply_to_message.from_user
             try:
                 await message.chat.ban(user_id=target.id)
-                await message.answer(f"{sender_name} отправил(а) {target.full_name} в банку с джемом.")
+                await message.answer(f"{sender_name} отправил(а) {target.first_name} в банку с джемом.")
             except Exception as e:
                 await message.answer(f"Ошибка: {e}")
         conn.close()
@@ -161,7 +161,7 @@ async def process_all_messages(message: Message):
                     permissions=ChatPermissions(can_send_messages=False),
                     until_date=until_date
                 )
-                await message.answer(f"{sender_name} напоил(а) клиновым сиропом {target.full_name}. Теперь он(а) не сможет говорить 1 дн.!")
+                await message.answer(f"{sender_name} напоил(а) клиновым сиропом {target.first_name}. Теперь он(а) не сможет говорить 1 дн.!")
             except Exception as e:
                 await message.answer(f"Ошибка: {e}")
         conn.close()
@@ -180,7 +180,7 @@ async def process_all_messages(message: Message):
                     permissions=ChatPermissions(can_send_messages=False),
                     until_date=until_date
                 )
-                await message.answer(f"{sender_name} напоил(а) клиновым сиропом {target.full_name}. Теперь он(а) не сможет говорить {time_str}!")
+                await message.answer(f"{sender_name} напоил(а) клиновым сиропом {target.first_name}. Теперь он(а) не сможет говорить {time_str}!")
             except Exception as e:
                 await message.answer(f"Ошибка: {e}")
         conn.close()
@@ -199,7 +199,7 @@ async def process_all_messages(message: Message):
                         can_add_web_page_previews=True
                     )
                 )
-                await message.answer(f"{target.full_name} дали воды, теперь он(а) может говорить. С возвращением!")
+                await message.answer(f"{target.first_name} дали воды, теперь он(а) может говорить. С возвращением!")
             except Exception as e:
                 await message.answer(f"Ошибка: {e}")
         conn.close()
@@ -209,7 +209,7 @@ async def process_all_messages(message: Message):
     if unban_match:
         if await is_admin(message):
             target_username = unban_match.group(1).lstrip("@")
-            cursor.execute("SELECT user_id, full_name FROM stats WHERE chat_id = ? AND LOWER(username) = ?", (message.chat.id, target_username.lower()))
+            cursor.execute("SELECT user_id, first_name FROM stats WHERE chat_id = ? AND LOWER(username) = ?", (message.chat.id, target_username.lower()))
             row = cursor.fetchone()
             if row:
                 target_id, target_name = row
@@ -231,7 +231,7 @@ async def process_all_messages(message: Message):
             conn.commit()
             cursor.execute("SELECT warn_count FROM warns WHERE chat_id = ? AND user_id = ?", (message.chat.id, target.id))
             warns = cursor.fetchone()[0]
-            await message.answer(f"{sender_name} отругал(а) {target.full_name}! [Варнов: {warns}/3]")
+            await message.answer(f"{sender_name} отругал(а) {target.first_name}! [Варнов: {warns}/3]")
             if warns >= 3:
                 try:
                     await message.chat.ban(user_id=target.id)
