@@ -27,8 +27,7 @@ def init_db():
 
 init_db()
 
-# Защищенные слова
-FORBIDDEN_PATTERNS = [r"правила.*", r"устав.*", r"актив.*", r"стата.*", r"статистика.*", r"варн.*", r"отругать.*", r"банка.*", r"сироп.*", r"воды.*", r"ники.*", r"звания.*", r"команды.*", r"роль.*", r"повысить.*", r"понизить.*"]
+FORBIDDEN_PATTERNS = [r"правила.*", r"устав.*", r"актив.*", r"стата.*", r"статистика.*", r"варн.*", r"отругать.*", r"банка.*", r"сироп.*", r"воды.*", r"плод.*", r"ники.*", r"звания.*", r"команды.*", r"роль.*", r"повысить.*", r"понизить.*"]
 
 async def get_user_lvl(m: Message, uid: int) -> int:
     if m.chat.type in ["private"]: return 0
@@ -63,7 +62,23 @@ def parse_time(t: str):
     if u in ["д", "ден", "день", "дня", "дней"]: return n * 1440, f"{n} дн."
     return n, f"{n} мин."
 
-# Смена названий ролей (Только для Овнера/Создателя)
+async def resolve_target(m: Message):
+    if m.reply_to_message:
+        u = m.reply_to_message.from_user
+        return u.id, u.first_name
+    words = m.text.split()
+    for w in words:
+        if w.startswith("@"):
+            uname = w.replace("@", "").lower().strip()
+            with get_db() as conn:
+                with conn.cursor() as c:
+                    c.execute("SELECT user_id, first_name FROM user_activity WHERE chat_id=%s AND LOWER(username)=%s", (m.chat.id, uname))
+                    res = c.fetchone()
+            if res: return res[0], res[1]
+            return None, w
+    return None, None
+
+# Смена названий ролей (Только для Овнера)
 @dp.message(F.text.startswith("+роль"))
 async def set_role_name(m: Message):
     if await get_user_lvl(m, m.from_user.id) < 4: return await m.answer("⚠️ Менять названия ролей может только Создатель группы.")
@@ -80,52 +95,51 @@ async def set_role_name(m: Message):
             conn.commit()
     await m.answer(f"✅ Должность уровня {lvl} переименована в **{name}**!", parse_mode="Markdown")
 
-# Повышение / Назначение модераторов
+# Повышение
 @dp.message(F.text.lower().startswith("повысить") | F.text.lower().startswith("+модер"))
 async def promote_user(m: Message):
     my_lvl = await get_user_lvl(m, m.from_user.id)
     if my_lvl < 3: return await m.answer("⚠️ Повышать участников могут только Администраторы.")
-    if not m.reply_to_message: return await m.answer("Ответьте на сообщение пользователя.")
+    tid, tname = await resolve_target(m)
+    if not tid: return await m.answer("⚠️ Выберите пользователя ответом или укажите `@username`.")
     p = m.text.split()
     target_lvl = int(p[1]) if len(p) > 1 and p[1].isdigit() else 1
     if target_lvl >= my_lvl: return await m.answer(f"⚠️ Вы можете повышать только до уровня ниже вашего (максимум {my_lvl - 1}).")
     
-    target = m.reply_to_message.from_user
     r1, r2, r3 = get_role_names(m.chat.id)
     role_title = {1: r1, 2: r2, 3: r3}.get(target_lvl, "Модератор")
 
     with get_db() as conn:
         with conn.cursor() as c:
-            c.execute("INSERT INTO mod_roles VALUES (%s,%s,%s) ON CONFLICT(chat_id, user_id) DO UPDATE SET role_level=EXCLUDED.role_level", (m.chat.id, target.id, target_lvl))
+            c.execute("INSERT INTO mod_roles VALUES (%s,%s,%s) ON CONFLICT(chat_id, user_id) DO UPDATE SET role_level=EXCLUDED.role_level", (m.chat.id, tid, target_lvl))
             conn.commit()
 
-    # Выдача прав админа в ТГ для уровня >= 2
     if target_lvl >= 2:
-        try: await m.chat.promote_member(target.id, can_restrict_members=True, can_delete_messages=True, can_invite_users=True)
-        except Exception as e: await m.answer(f"⚠️ Не удалось выдать права в Telegram: {e}")
+        try: await m.chat.promote_member(tid, can_restrict_members=True, can_delete_messages=True, can_invite_users=True)
+        except Exception as e: await m.answer(f"⚠️ Права в ТГ не выданы: {e}")
 
-    await m.answer(f"👑 Пользователь {target.first_name} назначен на должность **{role_title}** (Уровень {target_lvl})!", parse_mode="Markdown")
+    await m.answer(f"👑 Пользователь **{tname}** назначен на должность **{role_title}** (Уровень {target_lvl})!", parse_mode="Markdown")
 
-# Понижение / Снятие модераторов
+# Понижение
 @dp.message(F.text.lower().startswith("понизить") | F.text.lower().startswith("-модер"))
 async def demote_user(m: Message):
     my_lvl = await get_user_lvl(m, m.from_user.id)
     if my_lvl < 3: return await m.answer("⚠️ Понижать могут только Администраторы.")
-    if not m.reply_to_message: return await m.answer("Ответьте на сообщение пользователя.")
+    tid, tname = await resolve_target(m)
+    if not tid: return await m.answer("⚠️ Выберите пользователя ответом или укажите `@username`.")
     
-    target = m.reply_to_message.from_user
-    target_lvl = await get_user_lvl(m, target.id)
+    target_lvl = await get_user_lvl(m, tid)
     if target_lvl >= my_lvl: return await m.answer("⚠️ Вы не можете понизить участника с уровнем равным или выше вашего.")
 
     with get_db() as conn:
         with conn.cursor() as c:
-            c.execute("DELETE FROM mod_roles WHERE chat_id=%s AND user_id=%s", (m.chat.id, target.id))
+            c.execute("DELETE FROM mod_roles WHERE chat_id=%s AND user_id=%s", (m.chat.id, tid))
             conn.commit()
-    try: await m.chat.promote_member(target.id, can_restrict_members=False, can_delete_messages=False, can_invite_users=False)
+    try: await m.chat.promote_member(tid, can_restrict_members=False, can_delete_messages=False, can_invite_users=False)
     except: pass
-    await m.answer(f"🔻 {target.first_name} разжалован до обычного участника.")
+    await m.answer(f"🔻 **{tname}** разжалован до обычного участника.")
 
-# Устав Сада (Правила)
+# Устав Сада
 @dp.message(F.text.startswith("+устав") | F.text.startswith("+правила"))
 async def set_rules(m: Message):
     if await get_user_lvl(m, m.from_user.id) < 3: return await m.answer("⚠️ Изменять устав сада могут только Админы.")
@@ -151,26 +165,28 @@ async def get_rules(m: Message):
 async def set_nick(m: Message):
     p = m.text.split(maxsplit=1)
     if len(p) < 2: return await m.answer("Использование: `+ник [ник]`", parse_mode="Markdown")
-    target = m.reply_to_message.from_user if m.reply_to_message else m.from_user
-    if m.reply_to_message and await get_user_lvl(m, m.from_user.id) < 1:
+    tid, tname = await resolve_target(m)
+    if not tid: tid, tname = m.from_user.id, m.from_user.first_name
+    if tid != m.from_user.id and await get_user_lvl(m, m.from_user.id) < 1:
         return await m.answer("⚠️ Менять ники другим могут только модераторы.")
     with get_db() as conn:
         with conn.cursor() as c:
-            c.execute("INSERT INTO custom_nicknames VALUES (%s,%s,%s) ON CONFLICT(chat_id, user_id) DO UPDATE SET nickname=EXCLUDED.nickname", (m.chat.id, target.id, p[1].strip()))
+            c.execute("INSERT INTO custom_nicknames VALUES (%s,%s,%s) ON CONFLICT(chat_id, user_id) DO UPDATE SET nickname=EXCLUDED.nickname", (m.chat.id, tid, p[1].strip()))
             conn.commit()
-    await m.answer(f"🏷 РП-ник для {target.first_name}: **{p[1].strip()}**", parse_mode="Markdown")
+    await m.answer(f"🏷 РП-ник для **{tname}**: **{p[1].strip()}**", parse_mode="Markdown")
 
 @dp.message(F.text == "-ник")
 async def rem_nick(m: Message):
-    target = m.reply_to_message.from_user if m.reply_to_message else m.from_user
-    if m.reply_to_message and await get_user_lvl(m, m.from_user.id) < 1:
+    tid, tname = await resolve_target(m)
+    if not tid: tid, tname = m.from_user.id, m.from_user.first_name
+    if tid != m.from_user.id and await get_user_lvl(m, m.from_user.id) < 1:
         return await m.answer("⚠️ Сбрасывать ники другим могут только модераторы.")
     with get_db() as conn:
         with conn.cursor() as c:
-            c.execute("DELETE FROM custom_nicknames WHERE chat_id=%s AND user_id=%s", (m.chat.id, target.id))
+            c.execute("DELETE FROM custom_nicknames WHERE chat_id=%s AND user_id=%s", (m.chat.id, tid))
             del_cnt = c.rowcount
             conn.commit()
-    await m.answer(f"🗑 РП-ник {target.first_name} сброшен." if del_cnt else "⚠️ РП-ник не найден.")
+    await m.answer(f"🗑 РП-ник **{tname}** сброшен." if del_cnt else "⚠️ РП-ник не найден.")
 
 @dp.message(F.text.lower().startswith("ники") | F.text.lower().startswith("звания"))
 async def list_nicks(m: Message):
@@ -194,7 +210,6 @@ async def add_cmd(m: Message):
     if len(p) < 3: return await m.answer("Использование: `+команда [имя] [текст]`\nЗаглушки: `{Username}`, `{Reply}`, `{Reply_message}`, `{Random}`", parse_mode="Markdown")
     c_name = p[1].lower().strip()
 
-    # Проверка на запрещённые/конфликтующие имена
     for pat in FORBIDDEN_PATTERNS:
         if re.fullmatch(pat, c_name):
             return await m.answer("⚠️ Нельзя создавать РП-команды, совпадающие или конфликтующие с системными командами (устав, правила, актив, варн и т.д.).")
@@ -234,7 +249,6 @@ async def process_msg(m: Message):
     if m.chat.type in ["private"]: return
     t = m.text.lower().strip()
     
-    # Фиксация активности
     with get_db() as conn:
         with conn.cursor() as c:
             c.execute("INSERT INTO user_activity VALUES (%s,%s,%s,%s,1) ON CONFLICT(chat_id, user_id) DO UPDATE SET message_count=user_activity.message_count+1, username=EXCLUDED.username, first_name=EXCLUDED.first_name", (m.chat.id, m.from_user.id, m.from_user.username, m.from_user.first_name))
@@ -242,39 +256,53 @@ async def process_msg(m: Message):
 
     lvl = await get_user_lvl(m, m.from_user.id)
 
-    # ХЕЛПЕР (Уровень 1+) — МУТ / РАЗМУТ
+    # УРОВЕНЬ 1+ (Хелпер) — МУТЫ И СНЯТИЕ МУТА
     if lvl >= 1:
-        if (t.startswith("клиновый сироп") or t.startswith("напоить сиропом")) and m.reply_to_message:
-            mins, disp = parse_time(t.replace("клиновый сироп","").replace("напоить сиропом","").strip())
-            try:
-                await m.chat.restrict(m.reply_to_message.from_user.id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now()+timedelta(minutes=mins))
-                return await m.answer(f"🍁 {m.reply_to_message.from_user.first_name} молчит {disp}.")
-            except Exception as e: return await m.answer(f"Ошибка: {e}")
-        elif t == "дать воды" and m.reply_to_message:
-            try:
-                await m.chat.restrict(m.reply_to_message.from_user.id, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True))
-                return await m.answer(f"💧 {m.reply_to_message.from_user.first_name} размучен!")
-            except Exception as e: return await m.answer(f"Ошибка: {e}")
+        if t.startswith("клиновый сироп") or t.startswith("напоить сиропом"):
+            tid, tname = await resolve_target(m)
+            if tid:
+                clean_t = re.sub(r"@\w+", "", t).replace("клиновый сироп","").replace("напоить сиропом","").strip()
+                mins, disp = parse_time(clean_t)
+                try:
+                    await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now()+timedelta(minutes=mins))
+                    return await m.answer(f"🍁 **{tname}** молчит {disp}.")
+                except Exception as e: return await m.answer(f"Ошибка: {e}")
+        elif t.startswith("дать плод всей боли"):
+            tid, tname = await resolve_target(m)
+            if tid:
+                try:
+                    await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now()+timedelta(days=1))
+                    return await m.answer(f"🍎 **{tname}** в муте на 1 день (получил плод всей боли).")
+                except Exception as e: return await m.answer(f"Ошибка: {e}")
+        elif t.startswith("дать воды"):
+            tid, tname = await resolve_target(m)
+            if tid:
+                try:
+                    await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True))
+                    return await m.answer(f"💧 **{tname}** размучен!")
+                except Exception as e: return await m.answer(f"Ошибка: {e}")
 
-    # МОДЕР (Уровень 2+) — БАН / КИК / СТАТИСТИКА
+    # УРОВЕНЬ 2+ (Модер) — ВАРНЫ И СТАТИСТИКА
     if lvl >= 2:
-        if t in ["банка с джемом", "в банку"] and m.reply_to_message:
-            try:
-                await m.chat.ban(m.reply_to_message.from_user.id)
-                return await m.answer(f"🫙 {m.reply_to_message.from_user.first_name} забанен!")
-            except Exception as e: return await m.answer(f"Ошибка: {e}")
-        elif t.startswith("вытащить из банки"):
-            p = t.split()
-            if len(p) > 3 and p[3].startswith("@"):
+        if t.startswith("варн") or t.startswith("отругать"):
+            tid, tname = await resolve_target(m)
+            if tid:
                 with get_db() as conn:
                     with conn.cursor() as c:
-                        c.execute("SELECT user_id FROM user_activity WHERE chat_id=%s AND LOWER(username)=%s", (m.chat.id, p[3].replace("@","")))
+                        c.execute("SELECT warn_count FROM warn_system WHERE chat_id=%s AND user_id=%s", (m.chat.id, tid))
                         res = c.fetchone()
-                if res:
-                    try:
-                        await m.chat.unban(res[0])
-                        return await m.answer(f"🔓 {p[3]} разбанен!")
-                    except Exception as e: return await m.answer(f"Ошибка: {e}")
+                        warns = (res[0] if res else 0) + 1
+                        if warns >= 3:
+                            c.execute("DELETE FROM warn_system WHERE chat_id=%s AND user_id=%s", (m.chat.id, tid))
+                            conn.commit()
+                            try:
+                                await m.chat.ban(tid)
+                                return await m.answer(f"🫙 **{tname}** получил [3/3] варнов и забанен!")
+                            except Exception as e: return await m.answer(f"Ошибка: {e}")
+                        else:
+                            c.execute("INSERT INTO warn_system VALUES (%s,%s,%s) ON CONFLICT(chat_id, user_id) DO UPDATE SET warn_count=EXCLUDED.warn_count", (m.chat.id, tid, warns))
+                            conn.commit()
+                            return await m.answer(f"⚠️ **{tname}** получил предупреждение! [{warns}/3]")
         elif t in ["актив", "стата", "статистика"]:
             with get_db() as conn:
                 with conn.cursor() as c:
@@ -284,33 +312,24 @@ async def process_msg(m: Message):
             msg = "📊 **ТОП-20 участников:**\n\n" + "\n".join([f"{i}. {name} — {cnt} сообщ." for i, (name, cnt) in enumerate(top, 1)])
             return await m.answer(msg, parse_mode="Markdown")
 
-    # АДМИН (Уровень 3+) — ВАРНЫ / ПЛОД БОЛИ
+    # УРОВЕНЬ 3+ (Админ) — БАН И РАЗБАН
     if lvl >= 3:
-        if t == "дать плод всей боли" and m.reply_to_message:
-            try:
-                await m.chat.restrict(m.reply_to_message.from_user.id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now()+timedelta(days=1))
-                return await m.answer(f"🍎 {m.reply_to_message.from_user.first_name} в муте на 1 день.")
-            except Exception as e: return await m.answer(f"Ошибка: {e}")
-        elif t in ["варн", "отругать"] and m.reply_to_message:
-            u = m.reply_to_message.from_user
-            with get_db() as conn:
-                with conn.cursor() as c:
-                    c.execute("SELECT warn_count FROM warn_system WHERE chat_id=%s AND user_id=%s", (m.chat.id, u.id))
-                    res = c.fetchone()
-                    warns = (res[0] if res else 0) + 1
-                    if warns >= 3:
-                        c.execute("DELETE FROM warn_system WHERE chat_id=%s AND user_id=%s", (m.chat.id, u.id))
-                        conn.commit()
-                        try:
-                            await m.chat.ban(u.id)
-                            return await m.answer(f"🫙 {u.first_name} получил [3/3] варнов и забанен!")
-                        except Exception as e: return await m.answer(f"Ошибка: {e}")
-                    else:
-                        c.execute("INSERT INTO warn_system VALUES (%s,%s,%s) ON CONFLICT(chat_id, user_id) DO UPDATE SET warn_count=EXCLUDED.warn_count", (m.chat.id, u.id, warns))
-                        conn.commit()
-                        return await m.answer(f"⚠️ {u.first_name} получил предупреждение! [{warns}/3]")
+        if t.startswith("банка с джемом") or t.startswith("в банку"):
+            tid, tname = await resolve_target(m)
+            if tid:
+                try:
+                    await m.chat.ban(tid)
+                    return await m.answer(f"🫙 **{tname}** забанен (в банке с джемом)!")
+                except Exception as e: return await m.answer(f"Ошибка: {e}")
+        elif t.startswith("вытащить из банки"):
+            tid, tname = await resolve_target(m)
+            if tid:
+                try:
+                    await m.chat.unban(tid)
+                    return await m.answer(f"🔓 **{tname}** разбанен (вытащен из банки)!")
+                except Exception as e: return await m.answer(f"Ошибка: {e}")
 
-    # ВЫПОЛНЕНИЕ РП-КОМАНД (для всех)
+    # ВЫПОЛНЕНИЕ РП-КОМАНД
     with get_db() as conn:
         with conn.cursor() as c:
             c.execute("SELECT response_text FROM custom_commands WHERE chat_id=%s AND command_name=%s", (m.chat.id, t))
@@ -318,12 +337,12 @@ async def process_msg(m: Message):
     if cmd:
         sender = get_name(m.chat.id, m.from_user.id, m.from_user.first_name if m.from_user else "Кто-то")
         reply_user, reply_txt = "кого-то", ""
+        tid, tname = await resolve_target(m)
+        if tid:
+            reply_user = get_name(m.chat.id, tid, tname)
         if m.reply_to_message:
-            if m.reply_to_message.from_user:
-                reply_user = get_name(m.chat.id, m.reply_to_message.from_user.id, m.reply_to_message.from_user.first_name)
             reply_txt = m.reply_to_message.text or m.reply_to_message.caption or ""
 
-        # Подстановка {Random}
         rand_user = "Кто-то"
         with get_db() as conn:
             with conn.cursor() as c:
@@ -342,4 +361,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+                    
