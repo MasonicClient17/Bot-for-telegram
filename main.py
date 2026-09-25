@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import re
 import sqlite3
 import os
@@ -52,6 +53,16 @@ def init_db():
             PRIMARY KEY (chat_id, command_name)
         )
     """)
+
+    # Таблица кастомных ников
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS custom_nicknames (
+            chat_id INTEGER,
+            user_id INTEGER,
+            nickname TEXT,
+            PRIMARY KEY (chat_id, user_id)
+        )
+    """)
     
     conn.commit()
     conn.close()
@@ -65,6 +76,19 @@ async def is_admin(message: Message) -> bool:
         return False
     member = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
     return member.status in ["administrator", "creator"]
+
+
+# Вспомогательная функция для получения отображаемого имени (РП-ник или first_name)
+def get_display_name(chat_id: int, user_id: int, default_name: str) -> str:
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT nickname FROM custom_nicknames WHERE chat_id = ? AND user_id = ?",
+        (chat_id, user_id)
+    )
+    res = cursor.fetchone()
+    conn.close()
+    return res[0] if res else default_name
 
 
 # Вспомогательная функция для парсинга времени мута
@@ -87,6 +111,137 @@ def parse_time(time_str: str):
         return num, f"{num} мин."
 
 
+# === УСТАНОВКА КАСТОМНОГО НИКА (+ник) ===
+@dp.message(F.text.startswith("+ник"))
+async def set_custom_nickname(message: Message):
+    if message.chat.type in ["private"]:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: `+ник [твой ник]`", parse_mode="Markdown")
+        return
+
+    new_nick = parts[1].strip()
+    chat_id = message.chat.id
+
+    # Если команда отправлена в ответ на сообщение другого пользователя
+    if message.reply_to_message:
+        if not await is_admin(message):
+            await message.answer("⚠️ Менять ники другим участникам могут только администраторы.")
+            return
+        target_user = message.reply_to_message.from_user
+    else:
+        target_user = message.from_user
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO custom_nicknames (chat_id, user_id, nickname)
+        VALUES (?, ?, ?)
+        ON CONFLICT(chat_id, user_id) DO UPDATE SET nickname = excluded.nickname
+    """, (chat_id, target_user.id, new_nick))
+    conn.commit()
+    conn.close()
+
+    await message.answer(
+        f"🏷 РП-ник для {target_user.first_name} успешно изменён на: **{new_nick}**",
+        parse_mode="Markdown"
+    )
+
+
+# === СБРОС КАСТОМНОГО НИКА (-ник) ===
+@dp.message(F.text == "-ник")
+async def remove_custom_nickname(message: Message):
+    if message.chat.type in ["private"]:
+        return
+
+    chat_id = message.chat.id
+
+    # Если ответ на сообщение — сбросить ник другому (только для админов)
+    if message.reply_to_message:
+        if not await is_admin(message):
+            await message.answer("⚠️ Сбрасывать ники другим участникам могут только администраторы.")
+            return
+        target_user = message.reply_to_message.from_user
+    else:
+        # Иначе сбрасываем свой ник (доступно каждому)
+        target_user = message.from_user
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "DELETE FROM custom_nicknames WHERE chat_id = ? AND user_id = ?",
+        (chat_id, target_user.id)
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+
+    if deleted > 0:
+        await message.answer(f"🗑 РП-ник пользователя {target_user.first_name} сброшен.")
+    else:
+        await message.answer(f"⚠️ У {target_user.first_name} не было установленного РП-ника.")
+
+
+# === СПИСОК НИКНЕЙМОВ / ЗВАНИЙ (с пагинацией) ===
+@dp.message(F.text.lower().startswith("ники") | F.text.lower().startswith("звания"))
+async def list_custom_nicknames(message: Message):
+    if message.chat.type in ["private"]:
+        return
+
+    parts = message.text.split()
+    page = 1
+    if len(parts) > 1 and parts[1].isdigit():
+        page = int(parts[1])
+
+    if page < 1:
+        page = 1
+
+    chat_id = message.chat.id
+    limit = 10
+    offset = (page - 1) * limit
+
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    
+    # Получаем общее количество сохранённых ников
+    cursor.execute("SELECT COUNT(*) FROM custom_nicknames WHERE chat_id = ?", (chat_id,))
+    total_count = cursor.fetchone()[0]
+
+    if total_count == 0:
+        conn.close()
+        await message.answer("📝 В этом чате пока ни у кого нет кастомных РП-ников.")
+        return
+
+    total_pages = math.ceil(total_count / limit)
+    if page > total_pages:
+        page = total_pages
+        offset = (page - 1) * limit
+
+    # Выбираем ники для нужной страницы
+    cursor.execute("""
+        SELECT n.user_id, n.nickname, a.first_name 
+        FROM custom_nicknames n
+        LEFT JOIN user_activity a ON n.chat_id = a.chat_id AND n.user_id = a.user_id
+        WHERE n.chat_id = ?
+        ORDER BY n.nickname ASC
+        LIMIT ? OFFSET ?
+    """, (chat_id, limit, offset))
+    
+    nicknames = cursor.fetchall()
+    conn.close()
+
+    list_msg = f"🏷 **Кастомные ники чата (Страница {page}/{total_pages}):**\n\n"
+    for idx, (uid, nick, original_name) in enumerate(nicknames, start=offset + 1):
+        name_display = original_name if original_name else f"ID: {uid}"
+        list_msg += f"{idx}. **{nick}** *(ориг: {name_display})*\n"
+
+    list_msg += f"\n💡 _Используй `ники [номер страницы]` для навигации._"
+
+    await message.answer(list_msg, parse_mode="Markdown")
+
+
 # === ДОБАВЛЕНИЕ КАСТОМНЫХ РП-КОМАНД ===
 @dp.message(F.text.startswith("+комманда") | F.text.startswith("+команда"))
 async def add_custom_command(message: Message):
@@ -98,8 +253,8 @@ async def add_custom_command(message: Message):
         await message.answer(
             "Использование: `+команда [название] [текст ответа]`\n\n"
             "**Доступные переменные:**\n"
-            "• `{Username}` — имя отправителя\n"
-            "• `{Reply}` — имя того, кому ответили\n"
+            "• `{Username}` — РП-ник (или имя) отправителя\n"
+            "• `{Reply}` — РП-ник (или имя) того, кому ответили\n"
             "• `{Reply_message}` — текст исходного сообщения", 
             parse_mode="Markdown"
         )
@@ -356,20 +511,24 @@ async def process_all_messages(message: Message):
     if custom_cmd:
         template = custom_cmd[0]
         
-        username = message.from_user.first_name if message.from_user else "Кто-то"
+        # Подтягиваем РП-ники (или стандартное имя, если ник не задан)
+        user_first_name = message.from_user.first_name if message.from_user else "Кто-то"
+        sender_name = get_display_name(chat_id, user_id, user_first_name)
+
         reply_user_name = "кого-то"
         reply_msg_text = ""
         
         if message.reply_to_message:
             if message.reply_to_message.from_user:
-                reply_user_name = message.reply_to_message.from_user.first_name
+                r_user = message.reply_to_message.from_user
+                reply_user_name = get_display_name(chat_id, r_user.id, r_user.first_name)
             if message.reply_to_message.text:
                 reply_msg_text = message.reply_to_message.text
             elif message.reply_to_message.caption:
                 reply_msg_text = message.reply_to_message.caption
 
         formatted_response = template.format(
-            Username=username,
+            Username=sender_name,
             Reply=reply_user_name,
             Reply_message=reply_msg_text
         )
@@ -385,4 +544,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-                                                
+        
