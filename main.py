@@ -330,23 +330,34 @@ async def process_msg(m: Message):
     # Игнорируем администраторов/модераторов (уровень >= 1)
     if lvl == 0:
         res = db_query("SELECT max_rate FROM antispam_settings WHERE chat_id=?", (m.chat.id,), fetchone=True)
-        max_rate = res[0] if res else 3
+        max_rate_sec = res[0] if res else 2  # Лимит в секунду (по умолчанию 2)
         
-        if max_rate > 0:
+        if max_rate_sec > 0:
             now = datetime.now().timestamp()
             user_data = spam_tracker[m.chat.id][m.from_user.id]
             
-            # Очищаем метки времени старше 1 секунды
-            valid_pairs = [(t, mid) for t, mid in zip(user_data["times"], user_data["ids"]) if now - t <= 1.0]
-            user_data["times"] = [t for t, _ in valid_pairs]
-            user_data["ids"] = [mid for _, mid in valid_pairs]
+            # --- 1. Очистка устаревших данных ---
+            # Для секунд (за последние 1.0 сек)
+            sec_pairs = [(t, mid) for t, mid in zip(user_data.get("sec_times", []), user_data.get("sec_ids", [])) if now - t <= 1.0]
+            user_data["sec_times"] = [t for t, _ in sec_pairs]
+            user_data["sec_ids"] = [mid for _, mid in sec_pairs]
             
-            # Добавляем текущее сообщение
-            user_data["times"].append(now)
-            user_data["ids"].append(m.message_id)
+            # Для минут (за последние 60.0 сек)
+            user_data["min_times"] = [t for t in user_data.get("min_times", []) if now - t <= 60.0]
             
-            # Проверяем превышение лимита
-            if len(user_data["times"]) > max_rate:
+            # --- 2. Добавление текущего сообщения ---
+            user_data["sec_times"].append(now)
+            user_data["sec_ids"].append(m.message_id)
+            user_data["min_times"].append(now)
+            
+            # Лимит в минуту (например, max_rate_sec * 10, при 2/сек будет 20/мин)
+            max_rate_min = max_rate_sec * 10
+            
+            # --- 3. Проверка превышения лимитов ---
+            is_sec_spam = len(user_data["sec_times"]) > max_rate_sec
+            is_min_spam = len(user_data["min_times"]) > max_rate_min
+            
+            if is_sec_spam or is_min_spam:
                 # Наказание: мут на 1 минуту
                 try:
                     await m.chat.restrict(
@@ -358,7 +369,7 @@ async def process_msg(m: Message):
                     logging.error(f"[ANTISPAM] Ошибка мута: {e}")
                 
                 # Удаляем последние 5 сообщений (или сколько успел отправить)
-                to_delete = user_data["ids"][-5:]
+                to_delete = user_data["sec_ids"][-5:]
                 for mid in to_delete:
                     try:
                         await bot.delete_message(m.chat.id, mid)
@@ -366,10 +377,11 @@ async def process_msg(m: Message):
                         pass
                 
                 # Сбрасываем трекер для этого юзера
-                spam_tracker[m.chat.id][m.from_user.id] = {"ids": [], "times": []}
+                spam_tracker[m.chat.id][m.from_user.id] = {"sec_times": [], "sec_ids": [], "min_times": []}
                 
+                reason = "в секунду" if is_sec_spam else "в минуту"
                 name = get_name(m.chat.id, m.from_user.id, m.from_user.first_name)
-                return await m.answer(f"🚫 **{name}** отправил(а) слишком много сообщений, получил(а) мут на 1 мин и сообщения удалены!", parse_mode="Markdown")
+                return await m.answer(f"🚫 **{name}** превысил(а) лимит сообщений ({reason}), получил(а) мут на 1 мин и сообщения удалены!", parse_mode="Markdown")
 
     t = m.text.lower().strip()
     db_query("""
@@ -377,7 +389,7 @@ async def process_msg(m: Message):
         ON CONFLICT(chat_id, user_id) DO UPDATE SET 
         message_count=user_activity.message_count+1, username=excluded.username, first_name=excluded.first_name
     """, (m.chat.id, m.from_user.id, m.from_user.username, m.from_user.first_name), commit=True)
-
+    
     # 1. ХЕЛПЕР
     if lvl >= 1:
         prefixes = ["клиновый сироп", "напоить сиропом", "дать плод всей боли", "дать воды"]
