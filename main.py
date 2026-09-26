@@ -10,7 +10,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ⚠️ Укажи ID своей служебной группы (обязательно добавь туда бота админом)
-STORAGE_CHAT_ID = -1001234567890  
+STORAGE_CHAT_ID = -1004327556129  
 DB_FILE = "bot_database.db"
 
 # Переменная для контроля отложенного сохранения (Debounce)
