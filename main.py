@@ -1,6 +1,7 @@
 import asyncio, json, logging, math, os, re, random, sqlite3
 from datetime import datetime, timedelta
 from io import BytesIO
+from collections import defaultdict
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import ChatPermissions, Message, BufferedInputFile
 
@@ -10,11 +11,14 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ⚠️ Укажи ID своей служебной группы (обязательно добавь туда бота админом)
-STORAGE_CHAT_ID = -1004327556129  
+STORAGE_CHAT_ID = -1001234567890  
 DB_FILE = "bot_database.db"
 
 # Переменная для контроля отложенного сохранения (Debounce)
 sync_task = None
+
+# Память для защиты от спама: {chat_id: {user_id: [msg_id1, msg_id2, ...], 'times': [time1, time2, ...]}}
+spam_tracker = defaultdict(lambda: defaultdict(lambda: {"ids": [], "times": []}))
 
 def db_query(sql, params=(), fetchone=False, fetchall=False, commit=False):
     with sqlite3.connect(DB_FILE) as conn:
@@ -32,6 +36,7 @@ def init_db():
     db_query("CREATE TABLE IF NOT EXISTS mod_roles (chat_id INTEGER, user_id INTEGER, role_level INTEGER DEFAULT 0, PRIMARY KEY (chat_id, user_id));", commit=True)
     db_query("CREATE TABLE IF NOT EXISTS role_names (chat_id INTEGER PRIMARY KEY, r1 TEXT DEFAULT 'Хелпер', r2 TEXT DEFAULT 'Модер', r3 TEXT DEFAULT 'Админ');", commit=True)
     db_query("CREATE TABLE IF NOT EXISTS chat_rules (chat_id INTEGER PRIMARY KEY, rules_text TEXT);", commit=True)
+    db_query("CREATE TABLE IF NOT EXISTS antispam_settings (chat_id INTEGER PRIMARY KEY, max_rate INTEGER DEFAULT 5);", commit=True)
 
 init_db()
 
@@ -54,7 +59,8 @@ async def backup_to_telegram():
         "custom_commands": db_query("SELECT chat_id, command_name, response_text FROM custom_commands", fetchall=True),
         "nicknames": db_query("SELECT chat_id, user_id, nickname FROM custom_nicknames", fetchall=True),
         "mod_roles": db_query("SELECT chat_id, user_id, role_level FROM mod_roles", fetchall=True),
-        "role_names": db_query("SELECT chat_id, r1, r2, r3 FROM role_names", fetchall=True)
+        "role_names": db_query("SELECT chat_id, r1, r2, r3 FROM role_names", fetchall=True),
+        "antispam": db_query("SELECT chat_id, max_rate FROM antispam_settings", fetchall=True)
     }
 
     json_data = json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8')
@@ -108,6 +114,8 @@ async def restore_from_telegram():
             db_query("INSERT OR REPLACE INTO mod_roles VALUES (?,?,?)", tuple(m), commit=True)
         for rn in data.get("role_names", []):
             db_query("INSERT OR REPLACE INTO role_names VALUES (?,?,?,?)", tuple(rn), commit=True)
+        for a in data.get("antispam", []):
+            db_query("INSERT OR REPLACE INTO antispam_settings VALUES (?,?)", tuple(a), commit=True)
 
         logging.info(f"[RESTORE] БД успешно восстановлена из Telegram! Команд: {len(data.get('custom_commands', []))}")
     except Exception as e:
@@ -115,7 +123,7 @@ async def restore_from_telegram():
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
-FORBIDDEN_PATTERNS = [r"правила.*", r"устав.*", r"актив.*", r"стата.*", r"статистика.*", r"варн.*", r"отругать.*", r"банка.*", r"сироп.*", r"воды.*", r"плод.*", r"ники.*", r"звания.*", r"команды.*", r"роль.*", r"повысить.*", r"понизить.*"]
+FORBIDDEN_PATTERNS = [r"правила.*", r"устав.*", r"актив.*", r"стата.*", r"статистика.*", r"варн.*", r"отругать.*", r"банка.*", r"сироп.*", r"воды.*", r"плод.*", r"ники.*", r"звания.*", r"команды.*", r"роль.*", r"повысить.*", r"понизить.*", r"антиспам.*"]
 
 async def get_user_lvl(m: Message, uid: int) -> int:
     if m.chat.type == "private": return 0
@@ -165,6 +173,38 @@ async def resolve_target(m: Message):
     return None, None, None
 
 # ==================== ХЭНДЛЕРЫ И КОМАНДЫ ====================
+
+@dp.message(F.text.lower().startswith("+антиспам"))
+async def set_antispam(m: Message):
+    if await get_user_lvl(m, m.from_user.id) < 4: 
+        return await m.answer("⚠️ Настраивать анти-спам может только Создатель группы.")
+    
+    p = m.text.split()
+    if len(p) < 2:
+        return await m.answer("Использование: `+антиспам [число_сообщений_в_сек]`\nНапример: `+антиспам 5` (или `0` для выключения)", parse_mode="Markdown")
+    
+    val = p[1].lower().strip()
+    if val in ["0", "выкл", "off", "откл"]:
+        rate = 0
+        msg_text = "🛡 **Анти-спам отключен.**"
+    elif val.isdigit() and int(val) > 0:
+        rate = int(val)
+        msg_text = f"🛡 **Анти-спам обновлен!** Лимит: **{rate}** сообщ/сек."
+    else:
+        return await m.answer("⚠️ Укажите корректное число сообщений в секунду.")
+    
+    db_query("INSERT INTO antispam_settings VALUES (?,?) ON CONFLICT(chat_id) DO UPDATE SET max_rate=excluded.max_rate", (m.chat.id, rate), commit=True)
+    schedule_sync()
+    await m.answer(msg_text, parse_mode="Markdown")
+
+@dp.message(F.text.lower() == "антиспам")
+async def get_antispam(m: Message):
+    res = db_query("SELECT max_rate FROM antispam_settings WHERE chat_id=?", (m.chat.id,), fetchone=True)
+    rate = res[0] if res else 5
+    if rate == 0:
+        await m.answer("🛡 Анти-спам в этой группе **отключен**.")
+    else:
+        await m.answer(f"🛡 Текущий лимит анти-спама: **{rate}** сообщ/сек.")
 
 @dp.message(F.text.startswith("+роль"))
 async def set_role_name(m: Message):
@@ -284,14 +324,59 @@ async def list_cmds(m: Message):
 @dp.message(F.text)
 async def process_msg(m: Message):
     if m.chat.type == "private": return
+    
+    # ------------------- ПРОВЕРКА АНТИ-СПАМА -------------------
+    lvl = await get_user_lvl(m, m.from_user.id)
+    # Игнорируем администраторов/модераторов (уровень >= 1)
+    if lvl == 0:
+        res = db_query("SELECT max_rate FROM antispam_settings WHERE chat_id=?", (m.chat.id,), fetchone=True)
+        max_rate = res[0] if res else 5
+        
+        if max_rate > 0:
+            now = datetime.now().timestamp()
+            user_data = spam_tracker[m.chat.id][m.from_user.id]
+            
+            # Очищаем метки времени старше 1 секунды
+            valid_pairs = [(t, mid) for t, mid in zip(user_data["times"], user_data["ids"]) if now - t <= 1.0]
+            user_data["times"] = [t for t, _ in valid_pairs]
+            user_data["ids"] = [mid for _, mid in valid_pairs]
+            
+            # Добавляем текущее сообщение
+            user_data["times"].append(now)
+            user_data["ids"].append(m.message_id)
+            
+            # Проверяем превышение лимита
+            if len(user_data["times"]) > max_rate:
+                # Наказание: мут на 1 минуту
+                try:
+                    await m.chat.restrict(
+                        m.from_user.id,
+                        permissions=ChatPermissions(can_send_messages=False),
+                        until_date=datetime.now() + timedelta(minutes=1)
+                    )
+                except Exception as e:
+                    logging.error(f"[ANTISPAM] Ошибка мута: {e}")
+                
+                # Удаляем последние 5 сообщений (или сколько успел отправить)
+                to_delete = user_data["ids"][-5:]
+                for mid in to_delete:
+                    try:
+                        await bot.delete_message(m.chat.id, mid)
+                    except Exception:
+                        pass
+                
+                # Сбрасываем трекер для этого юзера
+                spam_tracker[m.chat.id][m.from_user.id] = {"ids": [], "times": []}
+                
+                name = get_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+                return await m.answer(f"🚫 **{name}** отправил(а) слишком много сообщений, получил(а) мут на 1 мин и сообщения удалены!", parse_mode="Markdown")
+
     t = m.text.lower().strip()
     db_query("""
         INSERT INTO user_activity VALUES (?,?,?,?,1) 
         ON CONFLICT(chat_id, user_id) DO UPDATE SET 
         message_count=user_activity.message_count+1, username=excluded.username, first_name=excluded.first_name
     """, (m.chat.id, m.from_user.id, m.from_user.username, m.from_user.first_name), commit=True)
-
-    lvl = await get_user_lvl(m, m.from_user.id)
 
     # 1. ХЕЛПЕР
     if lvl >= 1:
@@ -382,7 +467,6 @@ async def main():
     logging.info("🚀 Восстановление данных из Telegram...")
     await restore_from_telegram()
     
-    # Отправляем тестовый бэкап сразу при запуске
     logging.info("🧪 Тестовая отправка бэкапа...")
     await backup_to_telegram()
     
