@@ -330,7 +330,7 @@ async def process_msg(m: Message):
     # Игнорируем администраторов/модераторов (уровень >= 1)
     if lvl == 0:
         res = db_query("SELECT max_rate FROM antispam_settings WHERE chat_id=?", (m.chat.id,), fetchone=True)
-        max_rate = res[0] if res else 5
+        max_rate = res[0] if res else 3
         
         if max_rate > 0:
             now = datetime.now().timestamp()
