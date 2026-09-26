@@ -37,9 +37,16 @@ init_db()
 
 # ==================== СИНХРОНИЗАЦИЯ С TELEGRAM ====================
 
+def schedule_sync():
+    """Мгновенный вызов бэкапа с выводом лога для проверки."""
+    logging.info("[DEBUG] Вызвана функция schedule_sync()!")
+    asyncio.create_task(backup_to_telegram())
+
 async def backup_to_telegram():
     """Сохраняет всю локальную БД в JSON-файл и отправляет в тех-чат."""
+    logging.info(f"[DEBUG] Попытка бэкапа... STORAGE_CHAT_ID = {STORAGE_CHAT_ID}")
     if not STORAGE_CHAT_ID:
+        logging.warning("[STORAGE] STORAGE_CHAT_ID не задан или равен 0!")
         return
 
     data = {
@@ -60,26 +67,14 @@ async def backup_to_telegram():
             caption=f"📦 **Авто-бэкап базы данных**\n🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             parse_mode="Markdown"
         )
-        # Закрепляем свежий бэкап, чтобы легко найти его при перезапуске
         try:
             await bot.pin_chat_message(STORAGE_CHAT_ID, msg.message_id, disable_notification=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"[STORAGE] Не удалось закрепить сообщение: {e}")
+            
         logging.info("[STORAGE] Бэкап успешно загружен в Telegram!")
     except Exception as e:
         logging.error(f"[STORAGE] Ошибка отправки бэкапа: {e}")
-
-def schedule_sync():
-    """Дебаунсер: откладывает отправку в Telegram на 5 секунд, чтобы не спамить при частых запросах."""
-    global sync_task
-    if sync_task and not sync_task.done():
-        sync_task.cancel()
-    
-    async def delayed_sync():
-        await asyncio.sleep(5)
-        await backup_to_telegram()
-
-    sync_task = asyncio.create_task(delayed_sync())
 
 async def restore_from_telegram():
     """Выкачивает закрепленный backup.json из тех-чата и забивает локальный SQLite."""
@@ -386,6 +381,11 @@ async def process_msg(m: Message):
 async def main():
     logging.info("🚀 Восстановление данных из Telegram...")
     await restore_from_telegram()
+    
+    # Отправляем тестовый бэкап сразу при запуске
+    logging.info("🧪 Тестовая отправка бэкапа...")
+    await backup_to_telegram()
+    
     logging.info("✅ Запуск бота...")
     await dp.start_polling(bot)
 
