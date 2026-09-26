@@ -1,6 +1,5 @@
 import asyncio, json, logging, math, os, re, random, sqlite3
 from datetime import datetime, timedelta
-from io import BytesIO
 from collections import defaultdict
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import ChatPermissions, Message, BufferedInputFile
@@ -11,13 +10,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ⚠️ Укажи ID своей служебной группы (обязательно добавь туда бота админом)
-STORAGE_CHAT_ID = -1001234567890  
+STORAGE_CHAT_ID = -1004327556129  
 DB_FILE = "bot_database.db"
 
-# Переменная для контроля отложенного сохранения (Debounce)
-sync_task = None
-
-# Память для защиты от спама: {chat_id: {user_id: [msg_id1, msg_id2, ...], 'times': [time1, time2, ...]}}
+# Двойной трекер анти-спама: {chat_id: {user_id: {"sec_times": [], "sec_ids": [], "min_times": []}}}
 spam_tracker = defaultdict(lambda: defaultdict(lambda: {"sec_times": [], "sec_ids": [], "min_times": []}))
 
 def db_query(sql, params=(), fetchone=False, fetchall=False, commit=False):
@@ -36,20 +32,21 @@ def init_db():
     db_query("CREATE TABLE IF NOT EXISTS mod_roles (chat_id INTEGER, user_id INTEGER, role_level INTEGER DEFAULT 0, PRIMARY KEY (chat_id, user_id));", commit=True)
     db_query("CREATE TABLE IF NOT EXISTS role_names (chat_id INTEGER PRIMARY KEY, r1 TEXT DEFAULT 'Хелпер', r2 TEXT DEFAULT 'Модер', r3 TEXT DEFAULT 'Админ');", commit=True)
     db_query("CREATE TABLE IF NOT EXISTS chat_rules (chat_id INTEGER PRIMARY KEY, rules_text TEXT);", commit=True)
-    db_query("CREATE TABLE IF NOT EXISTS antispam_settings (chat_id INTEGER PRIMARY KEY, max_rate INTEGER DEFAULT 5);", commit=True)
+    db_query("CREATE TABLE IF NOT EXISTS antispam_settings (chat_id INTEGER PRIMARY KEY, max_rate INTEGER DEFAULT 2);", commit=True)
+    # Таблица настроек чата (delete_commands: 1 = удалять, 0 = оставлять)
+    db_query("CREATE TABLE IF NOT EXISTS chat_settings (chat_id INTEGER PRIMARY KEY, delete_commands INTEGER DEFAULT 1);", commit=True)
 
 init_db()
 
 # ==================== СИНХРОНИЗАЦИЯ С TELEGRAM ====================
 
 def schedule_sync():
-    """Мгновенный вызов бэкапа с выводом лога для проверки."""
+    """Мгновенный вызов бэкапа с выводом лога."""
     logging.info("[DEBUG] Вызвана функция schedule_sync()!")
     asyncio.create_task(backup_to_telegram())
 
 async def backup_to_telegram():
     """Сохраняет всю локальную БД в JSON-файл и отправляет в тех-чат."""
-    logging.info(f"[DEBUG] Попытка бэкапа... STORAGE_CHAT_ID = {STORAGE_CHAT_ID}")
     if not STORAGE_CHAT_ID:
         logging.warning("[STORAGE] STORAGE_CHAT_ID не задан или равен 0!")
         return
@@ -60,7 +57,8 @@ async def backup_to_telegram():
         "nicknames": db_query("SELECT chat_id, user_id, nickname FROM custom_nicknames", fetchall=True),
         "mod_roles": db_query("SELECT chat_id, user_id, role_level FROM mod_roles", fetchall=True),
         "role_names": db_query("SELECT chat_id, r1, r2, r3 FROM role_names", fetchall=True),
-        "antispam": db_query("SELECT chat_id, max_rate FROM antispam_settings", fetchall=True)
+        "antispam": db_query("SELECT chat_id, max_rate FROM antispam_settings", fetchall=True),
+        "settings": db_query("SELECT chat_id, delete_commands FROM chat_settings", fetchall=True)
     }
 
     json_data = json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8')
@@ -83,7 +81,7 @@ async def backup_to_telegram():
         logging.error(f"[STORAGE] Ошибка отправки бэкапа: {e}")
 
 async def restore_from_telegram():
-    """Выкачивает закрепленный backup.json из тех-чата и забивает локальный SQLite."""
+    """Выкачивает закрепленный backup.json из тех-чата и заполняет локальную БД."""
     if not STORAGE_CHAT_ID:
         logging.warning("[RESTORE] STORAGE_CHAT_ID не указан. Пропуск восстановления.")
         return
@@ -116,6 +114,8 @@ async def restore_from_telegram():
             db_query("INSERT OR REPLACE INTO role_names VALUES (?,?,?,?)", tuple(rn), commit=True)
         for a in data.get("antispam", []):
             db_query("INSERT OR REPLACE INTO antispam_settings VALUES (?,?)", tuple(a), commit=True)
+        for s in data.get("settings", []):
+            db_query("INSERT OR REPLACE INTO chat_settings VALUES (?,?)", tuple(s), commit=True)
 
         logging.info(f"[RESTORE] БД успешно восстановлена из Telegram! Команд: {len(data.get('custom_commands', []))}")
     except Exception as e:
@@ -123,7 +123,7 @@ async def restore_from_telegram():
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
-FORBIDDEN_PATTERNS = [r"правила.*", r"устав.*", r"актив.*", r"стата.*", r"статистика.*", r"варн.*", r"отругать.*", r"банка.*", r"сироп.*", r"воды.*", r"плод.*", r"ники.*", r"звания.*", r"команды.*", r"роль.*", r"повысить.*", r"понизить.*", r"антиспам.*"]
+FORBIDDEN_PATTERNS = [r"правила.*", r"устав.*", r"актив.*", r"стата.*", r"статистика.*", r"варн.*", r"отругать.*", r"банка.*", r"сироп.*", r"воды.*", r"плод.*", r"ники.*", r"звания.*", r"команды.*", r"роль.*", r"повысить.*", r"понизить.*", r"антиспам.*", r"удалком.*"]
 
 async def get_user_lvl(m: Message, uid: int) -> int:
     if m.chat.type == "private": return 0
@@ -172,7 +172,42 @@ async def resolve_target(m: Message):
             return None, w, w
     return None, None, None
 
+async def try_delete_trigger_msg(m: Message):
+    """Удаляет исходное сообщение с командой, если включена опция в настройках."""
+    res = db_query("SELECT delete_commands FROM chat_settings WHERE chat_id=?", (m.chat.id,), fetchone=True)
+    should_delete = res[0] if res else 1  # По умолчанию 1 (удалять)
+    if should_delete:
+        try:
+            await m.delete()
+        except Exception:
+            pass  # Игнорируем, если нет прав админа на удаление сообщений
+
 # ==================== ХЭНДЛЕРЫ И КОМАНДЫ ====================
+
+@dp.message(F.text.lower().in_(["+удалком", "вкл удалком"]))
+async def enable_cmd_delete(m: Message):
+    if await get_user_lvl(m, m.from_user.id) < 3: 
+        return await m.answer("⚠️ Переключать удаление команд могут только Администраторы.")
+    db_query("INSERT INTO chat_settings VALUES (?, 1) ON CONFLICT(chat_id) DO UPDATE SET delete_commands=1", (m.chat.id,), commit=True)
+    schedule_sync()
+    await m.answer("🗑 **Авто-удаление команд включено!** Теперь сообщения-триггеры будут стираться.")
+
+@dp.message(F.text.lower().in_(["-удалком", "выкл удалком"]))
+async def disable_cmd_delete(m: Message):
+    if await get_user_lvl(m, m.from_user.id) < 3: 
+        return await m.answer("⚠️ Переключать удаление команд могут только Администраторы.")
+    db_query("INSERT INTO chat_settings VALUES (?, 0) ON CONFLICT(chat_id) DO UPDATE SET delete_commands=0", (m.chat.id,), commit=True)
+    schedule_sync()
+    await m.answer("📝 **Авто-удаление команд отключено.** Сообщения пользователей будут оставаться.")
+
+@dp.message(F.text.lower() == "удалком")
+async def check_cmd_delete(m: Message):
+    res = db_query("SELECT delete_commands FROM chat_settings WHERE chat_id=?", (m.chat.id,), fetchone=True)
+    status = (res[0] if res else 1)
+    if status:
+        await m.answer("🗑 Авто-удаление сообщений-команд: **ВКЛЮЧЕНО**.")
+    else:
+        await m.answer("📝 Авто-удаление сообщений-команд: **ОТКЛЮЧЕНО**.")
 
 @dp.message(F.text.lower().startswith("+антиспам"))
 async def set_antispam(m: Message):
@@ -181,7 +216,7 @@ async def set_antispam(m: Message):
     
     p = m.text.split()
     if len(p) < 2:
-        return await m.answer("Использование: `+антиспам [число_сообщений_в_сек]`\nНапример: `+антиспам 5` (или `0` для выключения)", parse_mode="Markdown")
+        return await m.answer("Использование: `+антиспам [число_сообщений_в_сек]`\nНапример: `+антиспам 2` (или `0` для выключения)", parse_mode="Markdown")
     
     val = p[1].lower().strip()
     if val in ["0", "выкл", "off", "откл"]:
@@ -189,7 +224,7 @@ async def set_antispam(m: Message):
         msg_text = "🛡 **Анти-спам отключен.**"
     elif val.isdigit() and int(val) > 0:
         rate = int(val)
-        msg_text = f"🛡 **Анти-спам обновлен!** Лимит: **{rate}** сообщ/сек."
+        msg_text = f"🛡 **Анти-спам обновлен!** Лимит: **{rate}** сообщ/сек (и {rate*10} в мин)."
     else:
         return await m.answer("⚠️ Укажите корректное число сообщений в секунду.")
     
@@ -200,11 +235,11 @@ async def set_antispam(m: Message):
 @dp.message(F.text.lower() == "антиспам")
 async def get_antispam(m: Message):
     res = db_query("SELECT max_rate FROM antispam_settings WHERE chat_id=?", (m.chat.id,), fetchone=True)
-    rate = res[0] if res else 5
+    rate = res[0] if res else 2
     if rate == 0:
         await m.answer("🛡 Анти-спам в этой группе **отключен**.")
     else:
-        await m.answer(f"🛡 Текущий лимит анти-спама: **{rate}** сообщ/сек.")
+        await m.answer(f"🛡 Текущий лимит анти-спама: **{rate}** сообщ/сек (и **{rate*10}** в мин).")
 
 @dp.message(F.text.startswith("+роль"))
 async def set_role_name(m: Message):
@@ -325,40 +360,34 @@ async def list_cmds(m: Message):
 async def process_msg(m: Message):
     if m.chat.type == "private": return
     
-    # ------------------- ПРОВЕРКА АНТИ-СПАМА -------------------
+    # ------------------- 1. ПРОВЕРКА АНТИ-СПАМА -------------------
     lvl = await get_user_lvl(m, m.from_user.id)
-    # Игнорируем администраторов/модераторов (уровень >= 1)
     if lvl == 0:
         res = db_query("SELECT max_rate FROM antispam_settings WHERE chat_id=?", (m.chat.id,), fetchone=True)
-        max_rate_sec = res[0] if res else 2  # Лимит в секунду (по умолчанию 2)
+        max_rate_sec = res[0] if res else 2  # По умолчанию 2 сообщ/сек
         
         if max_rate_sec > 0:
             now = datetime.now().timestamp()
             user_data = spam_tracker[m.chat.id][m.from_user.id]
             
-            # --- 1. Очистка устаревших данных ---
-            # Для секунд (за последние 1.0 сек)
+            # Очистка устаревших меток
             sec_pairs = [(t, mid) for t, mid in zip(user_data.get("sec_times", []), user_data.get("sec_ids", [])) if now - t <= 1.0]
             user_data["sec_times"] = [t for t, _ in sec_pairs]
             user_data["sec_ids"] = [mid for _, mid in sec_pairs]
             
-            # Для минут (за последние 60.0 сек)
             user_data["min_times"] = [t for t in user_data.get("min_times", []) if now - t <= 60.0]
             
-            # --- 2. Добавление текущего сообщения ---
+            # Добавление текущего сообщения
             user_data["sec_times"].append(now)
             user_data["sec_ids"].append(m.message_id)
             user_data["min_times"].append(now)
             
-            # Лимит в минуту (например, max_rate_sec * 10, при 2/сек будет 20/мин)
-            max_rate_min = max_rate_sec * 10
+            max_rate_min = max_rate_sec * 10  # При 2 в сек -> 20 в мин
             
-            # --- 3. Проверка превышения лимитов ---
             is_sec_spam = len(user_data["sec_times"]) > max_rate_sec
             is_min_spam = len(user_data["min_times"]) > max_rate_min
             
             if is_sec_spam or is_min_spam:
-                # Наказание: мут на 1 минуту
                 try:
                     await m.chat.restrict(
                         m.from_user.id,
@@ -368,17 +397,13 @@ async def process_msg(m: Message):
                 except Exception as e:
                     logging.error(f"[ANTISPAM] Ошибка мута: {e}")
                 
-                # Удаляем последние 5 сообщений (или сколько успел отправить)
+                # Удаляем последние 5 сообщений
                 to_delete = user_data["sec_ids"][-5:]
                 for mid in to_delete:
-                    try:
-                        await bot.delete_message(m.chat.id, mid)
-                    except Exception:
-                        pass
+                    try: await bot.delete_message(m.chat.id, mid)
+                    except Exception: pass
                 
-                # Сбрасываем трекер для этого юзера
                 spam_tracker[m.chat.id][m.from_user.id] = {"sec_times": [], "sec_ids": [], "min_times": []}
-                
                 reason = "в секунду" if is_sec_spam else "в минуту"
                 name = get_name(m.chat.id, m.from_user.id, m.from_user.first_name)
                 return await m.answer(f"🚫 **{name}** превысил(а) лимит сообщений ({reason}), получил(а) мут на 1 мин и сообщения удалены!", parse_mode="Markdown")
@@ -389,13 +414,15 @@ async def process_msg(m: Message):
         ON CONFLICT(chat_id, user_id) DO UPDATE SET 
         message_count=user_activity.message_count+1, username=excluded.username, first_name=excluded.first_name
     """, (m.chat.id, m.from_user.id, m.from_user.username, m.from_user.first_name), commit=True)
-    
-    # 1. ХЕЛПЕР
+
+    # ------------------- 2. ИСПОЛНЕНИЕ МОДЕРАТОРСКИХ КОМАНД -------------------
+    # 2.1 ХЕЛПЕР
     if lvl >= 1:
         prefixes = ["клиновый сироп", "напоить сиропом", "дать плод всей боли", "дать воды"]
         if any(t.startswith(p) for p in prefixes):
             tid, tname, tstr = await resolve_target(m)
             if tid:
+                await try_delete_trigger_msg(m)
                 if t.startswith("дать воды"):
                     try:
                         await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True))
@@ -411,11 +438,12 @@ async def process_msg(m: Message):
                     return await m.answer(f"🍁 **{tname}** в муте на {disp}.{r_str}", parse_mode="Markdown")
                 except Exception as e: return await m.answer(f"Ошибка: {e}")
 
-    # 2. МОДЕР
+    # 2.2 МОДЕР
     if lvl >= 2:
         if t.startswith("варн") or t.startswith("отругать"):
             tid, tname, tstr = await resolve_target(m)
             if tid:
+                await try_delete_trigger_msg(m)
                 _, _, r_str = parse_mod_args(m.text, tstr, ["варн", "отругать"])
                 res = db_query("SELECT warn_count FROM warn_system WHERE chat_id=? AND user_id=?", (m.chat.id, tid), fetchone=True)
                 warns = (res[0] if res else 0) + 1
@@ -429,15 +457,17 @@ async def process_msg(m: Message):
                     db_query("INSERT INTO warn_system VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET warn_count=excluded.warn_count", (m.chat.id, tid, warns), commit=True)
                     return await m.answer(f"⚠️ **{tname}** получил предупреждение! [{warns}/3]{r_str}", parse_mode="Markdown")
         elif t in ["актив", "стата", "статистика"]:
+            await try_delete_trigger_msg(m)
             top = db_query("SELECT first_name, message_count FROM user_activity WHERE chat_id=? ORDER BY message_count DESC LIMIT 20", (m.chat.id,), fetchall=True)
             if not top: return await m.answer("Статистика пуста.")
             return await m.answer("📊 **ТОП-20 участников:**\n\n" + "\n".join([f"{i}. {name} — {cnt} сообщ." for i, (name, cnt) in enumerate(top, 1)]), parse_mode="Markdown")
 
-    # 3. АДМИН
+    # 2.3 АДМИН
     if lvl >= 3:
         if t.startswith("банка с джемом") or t.startswith("в банку"):
             tid, tname, tstr = await resolve_target(m)
             if tid:
+                await try_delete_trigger_msg(m)
                 _, _, r_str = parse_mod_args(m.text, tstr, ["банка с джемом", "в банку"])
                 try:
                     await m.chat.ban(tid)
@@ -446,14 +476,17 @@ async def process_msg(m: Message):
         elif t.startswith("вытащить из банки"):
             tid, tname, _ = await resolve_target(m)
             if tid:
+                await try_delete_trigger_msg(m)
                 try:
                     await m.chat.unban(tid)
                     return await m.answer(f"🔓 **{tname}** разбанен (вытащен из банки)!")
                 except Exception as e: return await m.answer(f"Ошибка: {e}")
 
-    # РП-КОМАНДЫ
+    # ------------------- 3. ИСПОЛНЕНИЕ РП-КОМАНД -------------------
     cmd = db_query("SELECT response_text FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, t), fetchone=True)
     if cmd:
+        await try_delete_trigger_msg(m)  # Удаляем исходный триггер (например, "обнять")
+        
         sender = get_name(m.chat.id, m.from_user.id, m.from_user.first_name if m.from_user else "Кто-то")
         tid, tname, _ = await resolve_target(m)
         reply_user = get_name(m.chat.id, tid, tname) if tid else "кого-то"
