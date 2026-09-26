@@ -18,7 +18,7 @@ DB_FILE = "bot_database.db"
 sync_task = None
 
 # Память для защиты от спама: {chat_id: {user_id: [msg_id1, msg_id2, ...], 'times': [time1, time2, ...]}}
-spam_tracker = defaultdict(lambda: defaultdict(lambda: {"ids": [], "times": []}))
+spam_tracker = defaultdict(lambda: defaultdict(lambda: {"sec_times": [], "sec_ids": [], "min_times": []}))
 
 def db_query(sql, params=(), fetchone=False, fetchall=False, commit=False):
     with sqlite3.connect(DB_FILE) as conn:
