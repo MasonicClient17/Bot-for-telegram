@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import random
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -11,7 +12,8 @@ from dotenv import load_dotenv
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ChatMemberStatus, ParseMode
-from aiogram.types import ChatPermissions
+from aiogram.filters import Command
+from aiogram.types import ChatPermissions, FSInputFile
 
 # 1. Загрузка переменных окружения
 load_dotenv()
@@ -761,6 +763,62 @@ async def list_custom_cmds(message: types.Message):
 
     cmds = ", ".join([f"<code>{r[0]}</code>" for r in rows])
     await message.answer(f"🌈 <b>Кастомные РП-команды чата:</b>\n{cmds}", parse_mode=ParseMode.HTML)
+
+# --- Выгрузка бэкапа в JSON ---
+
+async def export_db_to_dict() -> dict:
+    """Извлекает всю информацию из SQLite и формирует словарь для JSON."""
+    data = {}
+    tables = ["users", "roles_custom", "rules_chapters", "rules_items", "custom_commands", "cmd_levels"]
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        for table in tables:
+            async with db.execute(f"SELECT * FROM {table}") as cursor:
+                rows = await cursor.fetchall()
+                data[table] = [dict(row) for row in rows]
+                
+    return data
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: types.Message):
+    # 1. Проверка совпадения STORAGE_GROUP_ID
+    if not STORAGE_GROUP_ID or str(message.chat.id) != str(STORAGE_GROUP_ID).strip():
+        return
+
+    # 2. Проверка: вызывать может только Создатель группы
+    try:
+        chat_member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        if chat_member.status != ChatMemberStatus.CREATOR:
+            return await message.answer("🌫 Команду бэкапа может вызывать только Создатель группы!")
+    except Exception:
+        return
+
+    msg = await message.answer("🔄 Выгружаю бэкап данных...")
+    backup_filename = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+    try:
+        # Сериализуем данные из SQLite в .json
+        data = await export_db_to_dict()
+        with open(backup_filename, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+
+        # Отправляем файл в хранилище
+        document = FSInputFile(backup_filename)
+        await message.answer_document(
+            document=document,
+            caption=f"📦 <b>Бэкап данных Сада успешно сформирован!</b>\n📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}",
+            parse_mode=ParseMode.HTML
+        )
+        await msg.delete()
+
+    except Exception as e:
+        await message.answer(f"⚠️ Ошибка при формировании бэкапа: <code>{e}</code>", parse_mode=ParseMode.HTML)
+
+    finally:
+        # Очищаем временный файл
+        if os.path.exists(backup_filename):
+            os.remove(backup_filename)
 
 # --- Запуск бота ---
 
