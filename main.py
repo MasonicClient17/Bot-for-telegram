@@ -1,407 +1,382 @@
-import asyncio, logging, os, re, random, json, aiosqlite
+import asyncio, json, logging, math, os, re, random, sqlite3, itertools
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.enums import ChatMemberStatus, ParseMode
-from aiogram.filters import Command
-from aiogram.types import ChatPermissions, FSInputFile
+from aiogram.types import ChatPermissions, BufferedInputFile
 
-load_dotenv()
-BOT_TOKEN, STORAGE_GROUP_ID = os.getenv("BOT_TOKEN", "").strip("'\""), os.getenv("STORAGE_GROUP_ID", "").strip("'\"")
-bot, dp, DB_PATH = Bot(token=BOT_TOKEN), Dispatcher(), "bot_database.db"
+logging.basicConfig(level=logging.INFO)
+BOT_TOKEN, STORAGE_CHAT_ID = os.getenv("BOT_TOKEN", "").strip("'\""), int(os.getenv("STORAGE_CHAT_ID", 0) or 0)
+bot, dp, DB_FILE = Bot(token=BOT_TOKEN), Dispatcher(), "bot_database.db"
 
 CALL_EMOJIS = ["🌸", "☁️", "👁", "🐍", "🌫", "🥛", "🫗", "🍨", "🍧", "🌈", "🍇", "🫙"]
-DEFAULT_CMD_LEVELS = {"клиновый сироп": 1, "напоить сиропом": 1, "дать плод всей боли": 1, "дать воды": 1, "калл": 1, "call": 1, "созыв": 1, "варн": 2, "отругать": 2, "актив": 2, "стата": 2, "статистика": 2, "банка с джемом": 3, "в банку": 3, "вытащить из банки": 3, "повысить": 3, "+модер": 3, "понизить": 3, "-модер": 3, "+устав": 3, "устав+": 3}
-SYSTEM_RESERVED_WORDS = list(DEFAULT_CMD_LEVELS.keys()) + ["устав", "правила", "устав сада", "правила сада", "ники", "звания", "+ник", "-ник", "+команда", "-команда", "список команд", "команды", "рп команды", "+роль", "сменить"]
+DEFAULT_CMD_LEVELS = {"калл": 0, "устав": 0, "правила": 0, "клиновый сироп": 1, "напоить сиропом": 1, "дать воды": 1, "дать плод всей боли": 1, "актив": 2, "стата": 2, "отругать": 2, "варн": 2, "в банку": 3, "банка с джемом": 3, "вытащить из банки": 3, "+устав": 3, "+правила": 3, "+приветствие": 3, "-приветствие": 3, "повысить": 3, "понизить": 3, "роль": 4, "сменить": 4}
+LEVEL_NAMES = {0: "Участник", 1: "Хелпер", 2: "Модератор", 3: "Администратор", 4: "Создатель"}
+FORBIDDEN_PATTERNS = [r"правила.*", r"устав.*", r"актив.*", r"стата.*", r"варн.*", r"отругать.*", r"банка.*", r"сироп.*", r"воды.*", r"плод.*", r"ники.*", r"звания.*", r"команды.*", r"повысить.*", r"понизить.*", r"сменить.*", r"приветствие.*"]
 
+def db_query(sql, params=(), fetchone=False, fetchall=False, commit=False):
+    with sqlite3.connect(DB_FILE) as conn:
+        c = conn.cursor()
+        c.execute(sql, params)
+        if commit: conn.commit()
+        if fetchone: return c.fetchone()
+        if fetchall: return c.fetchall()
+
+def init_db():
+    for q in [
+        "CREATE TABLE IF NOT EXISTS users (chat_id INT, user_id INT, role_level INT DEFAULT 0, warns INT DEFAULT 0, msg_count INT DEFAULT 0, rp_name TEXT, PRIMARY KEY (chat_id, user_id))",
+        "CREATE TABLE IF NOT EXISTS custom_commands (chat_id INT, command_name TEXT, response_text TEXT, PRIMARY KEY (chat_id, command_name))",
+        "CREATE TABLE IF NOT EXISTS mod_roles (chat_id INT, user_id INT, role_level INT DEFAULT 0, PRIMARY KEY (chat_id, user_id))",
+        "CREATE TABLE IF NOT EXISTS role_names (chat_id INT PRIMARY KEY, r1 TEXT DEFAULT 'Хелпер', r2 TEXT DEFAULT 'Модер', r3 TEXT DEFAULT 'Админ')",
+        "CREATE TABLE IF NOT EXISTS cmd_levels (chat_id INT, cmd_name TEXT, min_lvl INT, PRIMARY KEY (chat_id, cmd_name))",
+        "CREATE TABLE IF NOT EXISTS rules (chat_id INT, section INT, item INT, title TEXT, content TEXT, PRIMARY KEY (chat_id, section, item))",
+        "CREATE TABLE IF NOT EXISTS chat_members (chat_id INT, user_id INT, first_name TEXT, PRIMARY KEY (chat_id, user_id))",
+        "CREATE TABLE IF NOT EXISTS welcome_messages (chat_id INT PRIMARY KEY, welcome_text TEXT)"
+    ]: db_query(q, commit=True)
+
+init_db()
+
+# --- СИНХРОНИЗАЦИЯ С TELEGRAM ---
+def schedule_sync(): asyncio.create_task(backup_to_telegram())
+
+async def backup_to_telegram():
+    if not STORAGE_CHAT_ID: return
+    data = {
+        "rules": db_query("SELECT chat_id, section, item, title, content FROM rules", fetchall=True),
+        "custom_commands": db_query("SELECT chat_id, command_name, response_text FROM custom_commands", fetchall=True),
+        "users": db_query("SELECT chat_id, user_id, role_level, rp_name FROM users", fetchall=True),
+        "mod_roles": db_query("SELECT chat_id, user_id, role_level FROM mod_roles", fetchall=True),
+        "cmd_levels": db_query("SELECT chat_id, cmd_name, min_lvl FROM cmd_levels", fetchall=True),
+        "welcome": db_query("SELECT chat_id, welcome_text FROM welcome_messages", fetchall=True)
+    }
+    file = BufferedInputFile(json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'), filename="backup.json")
+    try:
+        msg = await bot.send_document(STORAGE_CHAT_ID, document=file, caption=f"📦 **Бэкап БД** | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        try: await bot.pin_chat_message(STORAGE_CHAT_ID, msg.message_id, disable_notification=True)
+        except: pass
+    except Exception as e: logging.error(f"[STORAGE] Ошибка бэкапа: {e}")
+
+async def restore_from_telegram():
+    if not STORAGE_CHAT_ID: return
+    try:
+        chat = await bot.get_chat(STORAGE_CHAT_ID)
+        if not chat.pinned_message or not chat.pinned_message.document or chat.pinned_message.document.file_name != "backup.json": return
+        finfo = await bot.get_file(chat.pinned_message.document.file_id)
+        data = json.loads((await bot.download_file(finfo.file_path)).read().decode('utf-8'))
+        for r in data.get("rules", []): db_query("INSERT OR REPLACE INTO rules VALUES (?,?,?,?,?)", tuple(r), commit=True)
+        for c in data.get("custom_commands", []): db_query("INSERT OR REPLACE INTO custom_commands VALUES (?,?,?)", tuple(c), commit=True)
+        for u in data.get("users", []): db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name) VALUES (?,?,?,?)", tuple(u), commit=True)
+        for cl in data.get("cmd_levels", []): db_query("INSERT OR REPLACE INTO cmd_levels VALUES (?,?,?)", tuple(cl), commit=True)
+        for w in data.get("welcome", []): db_query("INSERT OR REPLACE INTO welcome_messages VALUES (?,?)", tuple(w), commit=True)
+        logging.info("[RESTORE] Восстановлено успешно!")
+    except Exception as e: logging.error(f"[RESTORE] Ошибка: {e}")
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 async def try_delete(m: types.Message):
     try: await m.delete()
     except: pass
 
-class ActivityMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event: types.Message, data: dict):
-        if isinstance(event, types.Message) and event.from_user and not event.from_user.is_bot and event.chat.type in ["group", "supergroup"]:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("INSERT INTO users (chat_id, user_id, username, first_name, msg_count) VALUES (?,?,?,?,1) ON CONFLICT(chat_id, user_id) DO UPDATE SET msg_count=msg_count+1, username=excluded.username, first_name=excluded.first_name", (event.chat.id, event.from_user.id, event.from_user.username, event.from_user.first_name))
-                await db.commit()
-        return await handler(event, data)
-
-async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        for q in [
-            "CREATE TABLE IF NOT EXISTS users (chat_id INT, user_id INT, username TEXT, first_name TEXT, role_level INT DEFAULT 0, warns INT DEFAULT 0, msg_count INT DEFAULT 0, rp_name TEXT, PRIMARY KEY (chat_id, user_id))",
-            "CREATE TABLE IF NOT EXISTS roles_custom (chat_id INT, level INT, title TEXT, PRIMARY KEY (chat_id, level))",
-            "CREATE TABLE IF NOT EXISTS rules_chapters (chat_id INT, chapter_num INT, title TEXT, PRIMARY KEY (chat_id, chapter_num))",
-            "CREATE TABLE IF NOT EXISTS rules_items (chat_id INT, chapter_num INT, rule_num INT, text TEXT, PRIMARY KEY (chat_id, chapter_num, rule_num))",
-            "CREATE TABLE IF NOT EXISTS custom_commands (chat_id INT, cmd_name TEXT, cmd_text TEXT, PRIMARY KEY (chat_id, cmd_name))",
-            "CREATE TABLE IF NOT EXISTS cmd_levels (chat_id INT, cmd_name TEXT, required_level INT, PRIMARY KEY (chat_id, cmd_name))"
-        ]: await db.execute(q)
-        await db.commit()
-
-async def get_user_role(cid: int, uid: int) -> int:
+async def get_user_lvl(cid: int, uid: int) -> int:
     try:
-        if (await bot.get_chat_member(cid, uid)).status == ChatMemberStatus.CREATOR: return 4
+        if (await bot.get_chat_member(cid, uid)).status == "creator": return 4
     except: pass
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT role_level FROM users WHERE chat_id=? AND user_id=?", (cid, uid)) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else 0
+    res = db_query("SELECT role_level FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
+    return res[0] if res and res[0] is not None else 0
 
-async def get_req_lvl(cid: int, cmd: str) -> int:
-    cmd = cmd.lower().strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT required_level FROM cmd_levels WHERE chat_id=? AND cmd_name=?", (cid, cmd)) as cur:
-            row = await cur.fetchone()
-            return row[0] if row else DEFAULT_CMD_LEVELS.get(cmd, 0)
+def get_req_lvl(cid: int, cmd: str) -> int:
+    c = cmd.strip().lower()
+    res = db_query("SELECT min_lvl FROM cmd_levels WHERE chat_id=? AND cmd_name=?", (cid, c), fetchone=True)
+    return res[0] if res and res[0] is not None else DEFAULT_CMD_LEVELS.get(c, 0)
 
-async def get_disp_name(cid: int, user: types.User) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT rp_name FROM users WHERE chat_id=? AND user_id=?", (cid, user.id)) as cur:
-            row = await cur.fetchone()
-            return row[0] if row and row[0] else user.full_name
+async def check_access(m: types.Message, cmd: str) -> bool:
+    req, u_lvl = get_req_lvl(m.chat.id, cmd), await get_user_lvl(m.chat.id, m.from_user.id)
+    if u_lvl < req:
+        await m.answer(f"🌫 Недостаточно уровня допуска! Требуется: {req} ({LEVEL_NAMES.get(req, '')}).")
+        return False
+    return True
 
-def parse_dur(t: str) -> timedelta:
-    m = re.search(r"(\d+)\s*(мин|ч|час|дня|день|дней|д)", (t or "").lower())
-    if not m: return timedelta(minutes=60)
-    v, u = int(m.group(1)), m.group(2)
-    return timedelta(minutes=v) if "мин" in u else (timedelta(hours=v) if "ч" in u else timedelta(days=v))
+def get_name(cid: int, uid: int, default: str) -> str:
+    res = db_query("SELECT rp_name FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
+    return res[0] if res and res[0] else default
 
-async def resolve_target(m: types.Message) -> Optional[types.User]:
-    if m.reply_to_message and m.reply_to_message.from_user: return m.reply_to_message.from_user
-    txt = m.text or m.caption or ""
-    for e in (m.entities or []):
-        if e.type == "text_mention" and e.user: return e.user
-        elif e.type == "mention":
-            un = txt[e.offset:e.offset+e.length].lstrip("@").lower()
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT user_id FROM users WHERE chat_id=? AND LOWER(username)=?", (m.chat.id, un)) as cur:
-                    r = await cur.fetchone()
-                    if r:
-                        try: return (await bot.get_chat_member(m.chat.id, r[0])).user
-                        except: pass
-    return None
+def parse_mod_args(text: str, target_str: str, prefixes: list):
+    cleaned = text
+    for p in prefixes:
+        if cleaned.lower().startswith(p): cleaned = cleaned[len(p):].strip(); break
+    if target_str and target_str.startswith("@"): cleaned = re.sub(re.escape(target_str), "", cleaned, flags=re.I).strip()
+    mins, words = 60, cleaned.split()
+    if words:
+        m = re.match(r"^(\d+)\s*(мин|мин.|минут|минуты|ч|час|часа|часов|д|ден|день|дня|дней)?$", words[0].lower())
+        if m:
+            n, u = int(m.group(1)), m.group(2) or "мин"
+            mins = n * 60 if u.startswith("ч") else (n * 1440 if u.startswith("д") else n)
+            words = words[1:]
+    reason = " ".join(words).strip()
+    return mins, (f"\n📝 **Причина:** {reason}" if reason else "")
 
-@dp.message(F.text.regexp(r"(?i)^сменить\s+(?:\((.*?)\)|(\S+))\s+(\d+)$"))
-async def change_cmd_level(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < 4: return await m.answer("🌫 Только Создатель группы (4 уровень)!")
-    mat = re.match(r"^сменить\s+(?:\((.*?)\)|(\S+))\s+(\d+)$", m.text, re.I)
-    cmd, lvl = (mat.group(1) or mat.group(2)).lower().strip(), int(mat.group(3))
-    if cmd not in DEFAULT_CMD_LEVELS: return await m.answer("🌫 Эту команду нельзя перенастроить!")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO cmd_levels VALUES (?,?,?) ON CONFLICT(chat_id, cmd_name) DO UPDATE SET required_level=?", (m.chat.id, cmd, lvl, lvl))
-        await db.commit()
+async def resolve_target(m: types.Message):
+    if m.reply_to_message: return m.reply_to_message.from_user.id, m.reply_to_message.from_user.first_name, None
+    for w in m.text.split():
+        if w.startswith("@"):
+            un = w.replace("@", "").lower().strip()
+            res = db_query("SELECT user_id, first_name FROM chat_members WHERE chat_id=? AND LOWER(first_name)=?", (m.chat.id, un), fetchone=True)
+            return (res[0], res[1], w) if res else (None, w, w)
+    return None, None, None
+
+def track_user(cid: int, uid: int, fname: str):
+    if uid and uid != bot.id:
+        db_query("INSERT INTO chat_members VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET first_name=excluded.first_name", (cid, uid, fname), commit=True)
+        db_query("INSERT INTO users (chat_id, user_id, msg_count) VALUES (?,?,1) ON CONFLICT(chat_id, user_id) DO UPDATE SET msg_count=msg_count+1", (cid, uid), commit=True)
+
+# --- ПРИВЕТСТВИЕ НОВЫХ УЧАСТНИКОВ ---
+@dp.message(F.new_chat_members)
+async def welcome_new_members(m: types.Message):
+    res = db_query("SELECT welcome_text FROM welcome_messages WHERE chat_id=?", (m.chat.id,), fetchone=True)
+    if not res or not res[0]: return
+    for user in m.new_chat_members:
+        if user.is_bot: continue
+        track_user(m.chat.id, user.id, user.first_name)
+        uname = get_name(m.chat.id, user.id, user.first_name)
+        txt = res[0]
+        for pat, val in {r"\{user\}": uname, r"\{chat\}": m.chat.title or "Сад"}.items():
+            txt = re.sub(pat, val, txt, flags=re.I)
+        await m.answer(f"🌸 {txt}")
+
+@dp.message(F.text.startswith("+приветствие"))
+async def set_welcome(m: types.Message):
+    if not await check_access(m, "+приветствие"): return
+    text = m.text[13:].strip()
+    if not text:
+        return await m.answer("🫗 Укажите текст приветствия!\nПример: `+приветствие Добро пожаловать в {chat}, {user}!`\n\nПеременные: `{user}`, `{chat}`", parse_mode="Markdown")
+    db_query("INSERT INTO welcome_messages VALUES (?,?) ON CONFLICT(chat_id) DO UPDATE SET welcome_text=excluded.welcome_text", (m.chat.id, text), commit=True)
+    schedule_sync(); await try_delete(m)
+    await m.answer("🌸 Приветствие для новых участников установлено!")
+
+@dp.message(F.text.startswith("-приветствие"))
+async def remove_welcome(m: types.Message):
+    if not await check_access(m, "-приветствие"): return
+    db_query("DELETE FROM welcome_messages WHERE chat_id=?", (m.chat.id,), commit=True)
+    schedule_sync(); await try_delete(m)
+    await m.answer("🗑 Приветствие отключено.")
+
+@dp.message(F.text.lower() == "приветствие")
+async def show_welcome(m: types.Message):
+    res = db_query("SELECT welcome_text FROM welcome_messages WHERE chat_id=?", (m.chat.id,), fetchone=True)
+    if not res or not res[0]:
+        return await m.answer("🫙 Приветствие в этом чате не установлено.")
+    await m.answer(f"🌸 **Текущее приветствие:**\n\n{res[0]}", parse_mode="Markdown")
+
+# --- ХЭНДЛЕРЫ КОМАНД ---
+@dp.message(F.text.lower().startswith("сменить"))
+async def change_cmd_level_handler(m: types.Message):
+    if not await check_access(m, "сменить"): return
+    mat = re.search(r"^сменить\s*\((.+?)\)\s*(\d+)$", m.text.strip(), re.I)
+    if not mat: return await m.answer("🫗 Формат: `сменить (команда) уровень`", parse_mode="Markdown")
+    cmd, lvl = mat.group(1).strip().lower(), int(mat.group(2))
+    if not (0 <= lvl <= 4): return await m.answer("🫗 Уровень должен быть от 0 до 4!")
+    db_query("INSERT INTO cmd_levels VALUES (?,?,?) ON CONFLICT(chat_id, cmd_name) DO UPDATE SET min_lvl=excluded.min_lvl", (m.chat.id, cmd, lvl), commit=True)
+    schedule_sync(); await try_delete(m)
+    await m.answer(f"🌸 Уровень допуска для ({cmd}) изменён на {lvl} ({LEVEL_NAMES[lvl]}).")
+
+@dp.message(F.text.lower().startswith("калл"))
+async def call_all_handler(m: types.Message):
+    if not await check_access(m, "калл"): return
+    members = db_query("SELECT user_id FROM chat_members WHERE chat_id=?", (m.chat.id,), fetchall=True)
+    if not members: return await m.answer("🫙 В базе пока нет участников!")
+    reason = m.text[4:].strip()
+    hdr = f"🌈 Общий сбор!\nПричина: {reason}\n\n" if reason else "🌈 Общий сбор!\n\n"
+    mentions, emo_cycle = [], itertools.cycle(CALL_EMOJIS)
+    for (uid,) in members: mentions.append(f'<a href="tg://user?id={uid}">{next(emo_cycle)}</a>')
     await try_delete(m)
-    await m.answer(f"🌸 Уровень доступа для «<b>{cmd}</b>» изменен на <b>{lvl}</b>.", parse_mode=ParseMode.HTML)
+    for i in range(0, len(mentions), 50):
+        chunk = mentions[i:i+50]
+        await m.answer((hdr if i == 0 else "") + " ".join(chunk), parse_mode="HTML")
 
-@dp.message(F.text.regexp(r"(?i)^\+роль\s+([1-3])\s+(.+)$"))
-async def set_role_title(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < 4: return await m.answer("🌫 Только Создатель!")
-    mat = re.match(r"^\+роль\s+([1-3])\s+(.+)$", m.text, re.I)
-    lvl, title = int(mat.group(1)), mat.group(2).strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO roles_custom VALUES (?,?,?) ON CONFLICT(chat_id, level) DO UPDATE SET title=?", (m.chat.id, lvl, title, title))
-        await db.commit()
+@dp.message(F.text.lower().startswith(("актив", "стата")))
+async def stats_handler(m: types.Message):
+    if not await check_access(m, "стата"): return
+    args = re.sub(r"^(актив|стата)", "", m.text, flags=re.I).strip()
+    page = max(1, int(args) if args.isdigit() else 1)
+    tot = (db_query("SELECT COUNT(*) FROM users WHERE chat_id=?", (m.chat.id,), fetchone=True) or [0])[0]
+    pages = math.ceil(tot / 10) or 1
+    if page > pages: return await m.answer(f"🫗 Страницы {page} нет. Всего: {pages}")
+    rows = db_query("SELECT u.user_id, u.msg_count, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=? ORDER BY u.msg_count DESC LIMIT 10 OFFSET ?", (m.chat.id, (page-1)*10), fetchall=True)
+    txt = f"📊 **Активность (Стр. {page}/{pages}):**\n\n" + "\n".join([f"{i}. {fn or 'ID:'+str(u)} — {cnt} сообщ." for i, (u, cnt, fn) in enumerate(rows, (page-1)*10+1)])
+    await try_delete(m); await m.answer(txt, parse_mode="Markdown")
+
+@dp.message(F.text.lower().startswith(("напоить сиропом", "клиновый сироп", "дать воды")))
+async def mute_handler(m: types.Message):
+    if not await check_access(m, "напоить сиропом"): return
+    tid, tname, tstr = await resolve_target(m)
+    if not tid: return await m.answer("🫗 Ответьте на сообщение!")
     await try_delete(m)
-    await m.answer(f"🌸 Должность уровня {lvl} переименована в «<b>{title}</b>».", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^(повысить|\+модер)(\s+[1-2])?$"))
-async def promote_user(m: types.Message):
-    u_role = await get_user_role(m.chat.id, m.from_user.id)
-    if u_role < await get_req_lvl(m.chat.id, "повысить"): return await m.answer("🌫 Недостаточно прав!")
-    target = await resolve_target(m)
-    if not target: return await m.answer("🌫 Укажите пользователя!")
-    mat = re.match(r"^(повысить|\+модер)(\s+[1-2])?$", m.text, re.I)
-    t_lvl = int(mat.group(2).strip()) if mat.group(2) else 1
-    if t_lvl >= u_role: return await m.answer("🌫 Нельзя повысить до своего уровня или выше!")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO users (chat_id, user_id, role_level) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET role_level=?", (m.chat.id, target.id, t_lvl, t_lvl))
-        await db.commit()
-    if t_lvl >= 2:
-        try: await bot.promote_chat_member(m.chat.id, target.id, can_manage_chat=True, can_delete_messages=True, can_restrict_members=True)
-        except: pass
-    await try_delete(m)
-    await m.answer(f"🌸 Пользователь {target.mention_html()} назначен на уровень <b>{t_lvl}</b>!", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^(понизить|-модер)$"))
-async def demote_user(m: types.Message):
-    u_role = await get_user_role(m.chat.id, m.from_user.id)
-    if u_role < await get_req_lvl(m.chat.id, "понизить"): return await m.answer("🌫 Недостаточно прав!")
-    target = await resolve_target(m)
-    if not target: return await m.answer("🌫 Укажите пользователя!")
-    if await get_user_role(m.chat.id, target.id) >= u_role: return await m.answer("🌫 Вы не можете понизить этого пользователя!")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET role_level=0 WHERE chat_id=? AND user_id=?", (m.chat.id, target.id))
-        await db.commit()
-    try: await bot.promote_chat_member(m.chat.id, target.id, can_manage_chat=False, can_delete_messages=False, can_restrict_members=False)
-    except: pass
-    await try_delete(m)
-    await m.answer(f"🌸 Пользователь {target.mention_html()} разжалован.", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^(клиновый сироп|напоить сиропом)"))
-async def mute_syrup(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "клиновый сироп"): return await m.answer("🌫 Недостаточно прав!")
-    target = await resolve_target(m)
-    if not target: return await m.answer("🌫 Ответьте нарушителю!")
-    dur = parse_dur(m.text)
-    try:
-        await bot.restrict_chat_member(m.chat.id, target.id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now()+dur)
-        await try_delete(m)
-        await m.answer(f"🫗 {target.mention_html()} напоен сиропом на <b>{dur}</b>.", parse_mode=ParseMode.HTML)
-    except Exception as e: await m.answer(f"⚠️ Ошибка: {e}")
-
-@dp.message(F.text.regexp(r"(?i)^дать плод всей боли"))
-async def mute_fruit_pain(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "дать плод всей боли"): return await m.answer("🌫 Недостаточно прав!")
-    target = await resolve_target(m)
-    if not target: return await m.answer("🌫 Ответьте нарушителю!")
-    try:
-        await bot.restrict_chat_member(m.chat.id, target.id, permissions=ChatPermissions(can_send_messages=False), until_date=datetime.now()+timedelta(days=1))
-        await try_delete(m)
-        await m.answer(f"🍇 Пользователь {target.mention_html()} получил плод всей боли (24 часа).", parse_mode=ParseMode.HTML)
-    except Exception as e: await m.answer(f"⚠️ Ошибка: {e}")
-
-@dp.message(F.text.regexp(r"(?i)^дать воды$"))
-async def unmute_water(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "дать воды"): return await m.answer("🌫 Недостаточно прав!")
-    target = await resolve_target(m)
-    if not target: return await m.answer("🌫 Ответьте пользователю!")
-    try:
-        await bot.restrict_chat_member(m.chat.id, target.id, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True))
-        await try_delete(m)
-        await m.answer(f"🥛 {target.mention_html()} получил воды. Мут снят.", parse_mode=ParseMode.HTML)
-    except Exception as e: await m.answer(f"⚠️ Ошибка: {e}")
-
-@dp.message(F.text.regexp(r"(?i)^(варн|отругать)"))
-async def issue_warn(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "варн"): return await m.answer("🌫 Недостаточно прав!")
-    target = await resolve_target(m)
-    if not target: return await m.answer("🌫 Ответьте нарушителю!")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO users (chat_id, user_id, warns) VALUES (?,?,1) ON CONFLICT(chat_id, user_id) DO UPDATE SET warns=warns+1", (m.chat.id, target.id))
-        await db.commit()
-        async with db.execute("SELECT warns FROM users WHERE chat_id=? AND user_id=?", (m.chat.id, target.id)) as cur: warns = (await cur.fetchone())[0]
-    await try_delete(m)
-    if warns >= 3:
+    if m.text.lower().startswith("дать воды"):
         try:
-            await bot.ban_chat_member(m.chat.id, target.id)
-            await m.answer(f"🐍 {target.mention_html()} получил 3/3 варнов и забанен!", parse_mode=ParseMode.HTML)
-        except Exception as e: await m.answer(f"⚠️ Ошибка бана: {e}")
-    else: await m.answer(f"👁 {target.mention_html()} получил предупреждение [{warns}/3].", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^(банка с джемом|в банку)"))
-async def ban_user(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "в банку"): return await m.answer("🌫 Недостаточно прав!")
-    target = await resolve_target(m)
-    if not target: return await m.answer("🌫 Ответьте нарушителю!")
+            await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True))
+            return await m.answer(f"🥛 Пользователь **{tname}** получил воды. Мут снят!")
+        except Exception as e: return await m.answer(f"👁 Ошибка: {e}")
+    mins, r_str = parse_mod_args(m.text, tstr, ["напоить сиропом", "клиновый сироп"])
     try:
-        await bot.ban_chat_member(m.chat.id, target.id)
+        await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=False), until_date=int(datetime.now().timestamp()) + mins*60)
+        await m.answer(f"🥛 **{tname}** отправлен молчать на {mins} мин.{r_str}")
+    except Exception as e: await m.answer(f"👁 Ошибка: {e}")
+
+@dp.message(F.text.lower().startswith("дать плод всей боли"))
+async def mute_24h_handler(m: types.Message):
+    if not await check_access(m, "дать плод всей боли"): return
+    tid, tname, _ = await resolve_target(m)
+    if not tid: return await m.answer("🫗 Ответьте на сообщение!")
+    reason = m.text[19:].strip() or "Не указана"
+    try:
+        await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=False), until_date=int(datetime.now().timestamp()) + 86400)
+        await try_delete(m); await m.answer(f"🍇 Пользователь **{tname}** вкусил плод всей боли (мут на 24 часа).\nПричина: {reason}")
+    except Exception as e: await m.answer(f"👁 Ошибка: {e}")
+
+@dp.message(F.text.lower().startswith(("в банку", "банка с джемом")))
+async def ban_handler(m: types.Message):
+    if not await check_access(m, "в банку"): return
+    tid, tname, _ = await resolve_target(m)
+    if not tid: return await m.answer("🫗 Ответьте на сообщение!")
+    reason = re.sub(r"^(в банку|банка с джемом)", "", m.text, flags=re.I).strip() or "Не указана"
+    try:
+        await m.chat.ban(tid); await try_delete(m)
+        await m.answer(f"🫙 Пользователь **{tname}** запечатан в банку с джемом (забанен).\nПричина: {reason}")
+    except Exception as e: await m.answer(f"👁 Ошибка: {e}")
+
+@dp.message(F.text.lower().startswith("вытащить из банки"))
+async def unban_handler(m: types.Message):
+    if not await check_access(m, "в банку"): return
+    tid, tname, _ = await resolve_target(m)
+    if not tid: return await m.answer("🫗 Ответьте на сообщение!")
+    try:
+        await m.chat.unban(tid, only_if_banned=True); await try_delete(m)
+        await m.answer(f"🌸 Пользователь **{tname}** извлечен из банки (разбанен)!")
+    except Exception as e: await m.answer(f"👁 Ошибка: {e}")
+
+@dp.message(F.text.startswith(("+устав", "+правила")))
+async def edit_rules_handler(m: types.Message):
+    if not await check_access(m, "+устав"): return
+    cnt = re.sub(r"^(\+устав|\+правила)", "", m.text, flags=re.I).strip()
+    m_app = re.match(r"^(\d+)\+\s+(.+?)\s+(.+)$", cnt, re.S)
+    if m_app:
+        sec, title, text = int(m_app.group(1)), m_app.group(2).strip(), m_app.group(3).strip()
+        max_item = (db_query("SELECT MAX(item) FROM rules WHERE chat_id=? AND section=?", (m.chat.id, sec), fetchone=True) or [0])[0]
+        nxt = (max_item or 0) + 1
+        db_query("INSERT INTO rules VALUES (?,?,?,?,?)", (m.chat.id, sec, nxt, title, text), commit=True)
+        schedule_sync(); await try_delete(m)
+        return await m.answer(f"🌸 Добавлен пункт {sec}.{nxt} [{title}] в конец раздела {sec}!")
+    m_itm = re.match(r"^(\d+)\.(\d+)\s+(.+?)\s+(.+)$", cnt, re.S)
+    if m_itm:
+        sec, itm, title, text = int(m_itm.group(1)), int(m_itm.group(2)), m_itm.group(3).strip(), m_itm.group(4).strip()
+        db_query("INSERT INTO rules VALUES (?,?,?,?,?) ON CONFLICT(chat_id, section, item) DO UPDATE SET title=excluded.title, content=excluded.content", (m.chat.id, sec, itm, title, text), commit=True)
+        schedule_sync(); await try_delete(m)
+        return await m.answer(f"🌸 Пункт {sec}.{itm} [{title}] сохранен!")
+    m_sec = re.match(r"^(\d+)\s+(.+)$", cnt)
+    if m_sec:
+        sec, title = int(m_sec.group(1)), m_sec.group(2).strip()
+        db_query("INSERT INTO rules VALUES (?,?,0,?,'') ON CONFLICT(chat_id, section, item) DO UPDATE SET title=excluded.title", (m.chat.id, sec, title), commit=True)
+        schedule_sync(); await try_delete(m)
+        return await m.answer(f"🌸 Раздел {sec} [{title}] создан!")
+    await m.answer("🫗 Неверный формат!")
+
+@dp.message(F.text.lower().startswith(("устав", "правила")))
+async def view_rules_handler(m: types.Message):
+    if not await check_access(m, "устав"): return
+    arg = re.sub(r"^(устав|правила)", "", m.text, flags=re.I).strip()
+    m_itm = re.match(r"^(\d+)\.(\d+)$", arg)
+    if m_itm:
+        sec, itm = int(m_itm.group(1)), int(m_itm.group(2))
+        res = db_query("SELECT title, content FROM rules WHERE chat_id=? AND section=? AND item=?", (m.chat.id, sec, itm), fetchone=True)
+        return await m.answer(f"📜 **Правило {sec}.{itm}: {res[0]}**\n\n{res[1]}" if res else f"🫙 Правило {sec}.{itm} не найдено!", parse_mode="Markdown")
+    if arg.isdigit():
+        items = db_query("SELECT item, title, content FROM rules WHERE chat_id=? AND section=? ORDER BY item ASC", (m.chat.id, int(arg)), fetchall=True)
+        if not items: return await m.answer(f"🫙 Раздел {arg} не найден!")
+        stitle = items[0][1] if items[0][0] == 0 else f"Раздел {arg}"
+        txt = f"📜 **Раздел {arg}. {stitle}**\n\n" + "\n\n".join([f"**{arg}.{i} {t}**\n{c}" for i, t, c in items if i != 0])
+        return await m.answer(txt, parse_mode="Markdown")
+    all_rules = db_query("SELECT section, item, title, content FROM rules WHERE chat_id=? ORDER BY section ASC, item ASC", (m.chat.id,), fetchall=True)
+    if not all_rules: return await m.answer("🫙 Устав ещё пуст!")
+    txt, cur_sec = "📜 **Устав / Правила чата:**\n\n", None
+    for sec, itm, title, content in all_rules:
+        if sec != cur_sec:
+            cur_sec = sec
+            txt += f"\n🔻 **Раздел {sec}. {title}**\n" if itm == 0 else f"\n🔻 **Раздел {sec}**\n"
+        if itm != 0: txt += f"▪️ **{sec}.{itm} {title}**: {content}\n"
+    await m.answer(txt, parse_mode="Markdown")
+
+@dp.message(F.text.startswith("+ник"))
+async def set_nick(m: types.Message):
+    p = m.text.split(maxsplit=1)
+    if len(p) < 2: return await m.answer("Использование: `+ник [ник]`", parse_mode="Markdown")
+    tid, tname, _ = await resolve_target(m)
+    if not tid: tid, tname = m.from_user.id, m.from_user.first_name
+    if tid != m.from_user.id and await get_user_lvl(m.chat.id, m.from_user.id) < 1: return await m.answer("🌫 Менять ники другим могут только модераторы.")
+    db_query("INSERT INTO users (chat_id, user_id, rp_name) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET rp_name=excluded.rp_name", (m.chat.id, tid, p[1].strip()), commit=True)
+    schedule_sync(); await try_delete(m)
+    await m.answer(f"🏷 РП-ник для **{tname}**: **{p[1].strip()}**", parse_mode="Markdown")
+
+@dp.message(F.text == "-ник")
+async def rem_nick(m: types.Message):
+    tid, tname, _ = await resolve_target(m)
+    if not tid: tid, tname = m.from_user.id, m.from_user.first_name
+    if tid != m.from_user.id and await get_user_lvl(m.chat.id, m.from_user.id) < 1: return await m.answer("🌫 Сбрасывать ники другим могут только модераторы.")
+    db_query("UPDATE users SET rp_name=NULL WHERE chat_id=? AND user_id=?", (m.chat.id, tid), commit=True)
+    schedule_sync(); await try_delete(m)
+    await m.answer(f"🗑 РП-ник **{tname}** сброшен.")
+
+@dp.message(F.text.startswith(("+команда", "+комманда")))
+async def add_cmd(m: types.Message):
+    p = m.text.split(maxsplit=2)
+    if len(p) < 3: return await m.answer("Использование: `+команда [имя] [текст]`", parse_mode="Markdown")
+    cn = p[1].lower().strip()
+    if any(re.fullmatch(pat, cn) for pat in FORBIDDEN_PATTERNS): return await m.answer("⚠️ Совпадает с системной командой.")
+    if db_query("SELECT command_name FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, cn), fetchone=True): return await m.answer(f"⚠️ Команда `{cn}` уже существует!")
+    db_query("INSERT INTO custom_commands VALUES (?,?,?)", (m.chat.id, cn, p[2]), commit=True)
+    schedule_sync(); await try_delete(m)
+    await m.answer(f"🌸 РП-команда `{cn}` сохранена!", parse_mode="Markdown")
+
+@dp.message(F.text.startswith(("-команда", "-комманда")))
+async def del_cmd(m: types.Message):
+    p = m.text.split(maxsplit=1)
+    if len(p) < 2: return await m.answer("Использование: `-команда [имя]`", parse_mode="Markdown")
+    cn = p[1].lower().strip()
+    db_query("DELETE FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, cn), commit=True)
+    schedule_sync(); await try_delete(m)
+    await m.answer(f"🗑 Команда `{cn}` удалена!")
+
+@dp.message(F.text.lower().in_(["список команд", "команды", "рп команды"]))
+async def list_cmds(m: types.Message):
+    cmds = db_query("SELECT command_name FROM custom_commands WHERE chat_id=? ORDER BY command_name", (m.chat.id,), fetchall=True)
+    if not cmds: return await m.answer("📝 В чате нет РП-команд.")
+    await try_delete(m)
+    await m.answer("🌈 **РП-команды:**\n\n" + "\n".join([f"• `{c[0]}`" for c in cmds]), parse_mode="Markdown")
+
+@dp.message(F.text)
+async def process_msg(m: types.Message):
+    if m.chat.type == "private" or not m.from_user: return
+    track_user(m.chat.id, m.from_user.id, m.from_user.first_name)
+    t = m.text.lower().strip()
+
+    cmd = db_query("SELECT response_text FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, t), fetchone=True)
+    if cmd:
         await try_delete(m)
-        await m.answer(f"🫙 {target.mention_html()} запечатан в банку с джемом.", parse_mode=ParseMode.HTML)
-    except Exception as e: await m.answer(f"⚠️ Ошибка: {e}")
+        sender = get_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+        tid, tname, _ = await resolve_target(m)
+        reply_user = get_name(m.chat.id, tid, tname) if tid else "кого-то"
+        reply_txt = (m.reply_to_message.text or m.reply_to_message.caption or "") if m.reply_to_message else ""
+        users = db_query("SELECT user_id, first_name FROM chat_members WHERE chat_id=?", (m.chat.id,), fetchall=True)
+        rand_user = get_name(m.chat.id, *random.choice(users)) if users else "Кто-то"
 
-@dp.message(F.text.regexp(r"(?i)^вытащить из банки$"))
-async def unban_user(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "вытащить из банки"): return await m.answer("🌫 Недостаточно прав!")
-    target = await resolve_target(m)
-    if not target: return await m.answer("🌫 Ответьте пользователю!")
-    try:
-        await bot.unban_chat_member(m.chat.id, target.id, only_if_banned=True)
-        await try_delete(m)
-        await m.answer(f"🌸 {target.mention_html()} вытащен из банки.", parse_mode=ParseMode.HTML)
-    except Exception as e: await m.answer(f"⚠️ Ошибка: {e}")
-
-@dp.message(F.text.regexp(r"(?i)^(актив|стата|статистика)$"))
-async def show_activity(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "актив"): return await m.answer("🌫 Недостаточно прав!")
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id, first_name, msg_count FROM users WHERE chat_id=? ORDER BY msg_count DESC LIMIT 20", (m.chat.id,)) as cur: rows = await cur.fetchall()
-    if not rows: return await m.answer("🍧 Статистика пуста.")
-    await try_delete(m)
-    txt = "🍧 <b>ТОП-20 активных участников:</b>\n\n" + "\n".join([f"{i}. {fn or f'ID:{u}'} — <b>{c}</b> сообщ." for i, (u, fn, c) in enumerate(rows, 1)])
-    await m.answer(txt, parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^(калл|call|созыв)(?:\s+(.+))?$"))
-async def call_all_users(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "калл"): return await m.answer("🌫 Недостаточно прав!")
-    mat = re.match(r"^(калл|call|созыв)(?:\s+(.+))?$", m.text, re.I)
-    call_txt = mat.group(2) or "Общий созыв участников Сада!"
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT user_id FROM users WHERE chat_id=?", (m.chat.id,)) as cur: rows = await cur.fetchall()
-    if not rows: return await m.answer("🌫 База участников пуста!")
-    await try_delete(m)
-    mentions = " ".join([f'<a href="tg://user?id={u}">{random.choice(CALL_EMOJIS)}</a>' for u, in rows])
-    await m.answer(f"🌸 <b>{call_txt}</b>\n\n{mentions}", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^\+устав\s+(\d+)\s+(.+)$"))
-async def add_rules_chapter(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "+устав"): return await m.answer("🌫 Недостаточно прав!")
-    mat = re.match(r"^\+устав\s+(\d+)\s+(.+)$", m.text, re.I)
-    cn, title = int(mat.group(1)), mat.group(2).strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO rules_chapters VALUES (?,?,?) ON CONFLICT(chat_id, chapter_num) DO UPDATE SET title=?", (m.chat.id, cn, title, title))
-        await db.commit()
-    await try_delete(m)
-    await m.answer(f"🌸 Раздел <b>{cn}. {title}</b> создан!", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^\+устав\s+(\d+)\.(\d+)\s+(.+)$"))
-async def add_rule_item(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "+устав"): return await m.answer("🌫 Недостаточно прав!")
-    mat = re.match(r"^\+устав\s+(\d+)\.(\d+)\s+(.+)$", m.text, re.I)
-    cn, rn, rtxt = int(mat.group(1)), int(mat.group(2)), mat.group(3).strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM rules_chapters WHERE chat_id=? AND chapter_num=?", (m.chat.id, cn)) as cur:
-            if not await cur.fetchone(): return await m.answer(f"🌫 Сначала создайте раздел {cn}!")
-        if rn > 1:
-            async with db.execute("SELECT 1 FROM rules_items WHERE chat_id=? AND chapter_num=? AND rule_num=?", (m.chat.id, cn, rn-1)) as cur:
-                if not await cur.fetchone(): return await m.answer(f"🌫 Нет правила {cn}.{rn-1}!")
-        await db.execute("INSERT INTO rules_items VALUES (?,?,?,?) ON CONFLICT(chat_id, chapter_num, rule_num) DO UPDATE SET text=?", (m.chat.id, cn, rn, rtxt, rtxt))
-        await db.commit()
-    await try_delete(m)
-    await m.answer(f"🌸 Добавлено правило <b>{cn}.{rn}</b>.", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^устав\s+(\d+)\+\s+(.+)$"))
-async def append_rule_item(m: types.Message):
-    if await get_user_role(m.chat.id, m.from_user.id) < await get_req_lvl(m.chat.id, "устав+"): return await m.answer("🌫 Недостаточно прав!")
-    mat = re.match(r"^устав\s+(\d+)\+\s+(.+)$", m.text, re.I)
-    cn, rtxt = int(mat.group(1)), mat.group(2).strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT MAX(rule_num) FROM rules_items WHERE chat_id=? AND chapter_num=?", (m.chat.id, cn)) as cur:
-            next_r = ((await cur.fetchone())[0] or 0) + 1
-        await db.execute("INSERT INTO rules_items VALUES (?,?,?,?)", (m.chat.id, cn, next_r, rtxt))
-        await db.commit()
-    await try_delete(m)
-    await m.answer(f"🌸 Правило добавлено под номером <b>{cn}.{next_r}</b>.", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^(устав сада|устав|правила|правила сада)(?:\s+(\d+)(?:\.(\d+))?)?$"))
-async def show_rules(m: types.Message):
-    mat = re.match(r"^(устав сада|устав|правила|правила сада)(?:\s+(\d+)(?:\.(\d+))?)?$", m.text, re.I)
-    cf, rf = mat.group(2), mat.group(3)
-    async with aiosqlite.connect(DB_PATH) as db:
-        if cf and rf:
-            async with db.execute("SELECT text FROM rules_items WHERE chat_id=? AND chapter_num=? AND rule_num=?", (m.chat.id, int(cf), int(rf))) as cur:
-                r = await cur.fetchone()
-                return await m.answer(f"🌸 <b>Правило {cf}.{rf}:</b> {r[0]}" if r else "🌫 Не найдено.")
-        elif cf:
-            async with db.execute("SELECT title FROM rules_chapters WHERE chat_id=? AND chapter_num=?", (m.chat.id, int(cf))) as cur:
-                cr = await cur.fetchone()
-                if not cr: return await m.answer("🌫 Раздел не найден.")
-                txt = f"<b>{cf}. {cr[0]}</b>\n"
-                async with db.execute("SELECT rule_num, text FROM rules_items WHERE chat_id=? AND chapter_num=? ORDER BY rule_num", (m.chat.id, int(cf))) as rcur:
-                    async for rn, rt in rcur: txt += f"{cf}.{rn}. {rt}\n"
-                return await m.answer(txt, parse_mode=ParseMode.HTML)
-        else:
-            txt = "🌸 <b>Устав Сада:</b>\n\n"
-            async with db.execute("SELECT chapter_num, title FROM rules_chapters WHERE chat_id=? ORDER BY chapter_num", (m.chat.id,)) as ccur:
-                chaps = await ccur.fetchall()
-                if not chaps: return await m.answer("🌸 Устав пуст.")
-                for cn, ct in chaps:
-                    txt += f"<b>{cn}. {ct}</b>\n"
-                    async with db.execute("SELECT rule_num, text FROM rules_items WHERE chat_id=? AND chapter_num=? ORDER BY rule_num", (m.chat.id, cn)) as rcur:
-                        async for rn, rt in rcur: txt += f"{cn}.{rn}. {rt}\n"
-                    txt += "\n"
-            return await m.answer(txt, parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^\+ник\s+(.+)$"))
-async def set_nickname(m: types.Message):
-    nn = re.match(r"^\+ник\s+(.+)$", m.text, re.I).group(1).strip()
-    target, u_role = await resolve_target(m), await get_user_role(m.chat.id, m.from_user.id)
-    tu = target if (target and target.id != m.from_user.id and u_role >= 1) else (message.from_user if not target or target.id == m.from_user.id else None)
-    if not tu: return await m.answer("🌫 Меняют ники другим только модераторы!")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO users (chat_id, user_id, rp_name) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET rp_name=?", (m.chat.id, tu.id, nn, nn))
-        await db.commit()
-    await try_delete(m)
-    await m.answer(f"🌸 РП-ник для {tu.mention_html()}: <b>{nn}</b>", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^\-ник$"))
-async def reset_nickname(m: types.Message):
-    target, u_role = await resolve_target(m), await get_user_role(m.chat.id, m.from_user.id)
-    tu = target if (target and target.id != m.from_user.id and u_role >= 1) else (message.from_user if not target or target.id == m.from_user.id else None)
-    if not tu: return await m.answer("🌫 Сбрасывают ники другим только модераторы!")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET rp_name=NULL WHERE chat_id=? AND user_id=?", (m.chat.id, tu.id))
-        await db.commit()
-    await try_delete(m)
-    await m.answer(f"🌸 РП-ник для {tu.mention_html()} сброшен.", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^\+команда\s+(\S+)\s+(.+)$"))
-async def add_custom_cmd(m: types.Message):
-    mat = re.match(r"^\+команда\s+(\S+)\s+(.+)$", m.text, re.I)
-    cn, ct = mat.group(1).lower().strip(), mat.group(2).strip()
-    if cn in SYSTEM_RESERVED_WORDS: return await m.answer("🌫 Запрещено перекрывать служебные команды!")
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM custom_commands WHERE chat_id=? AND cmd_name=?", (m.chat.id, cn)) as cur:
-            if await cur.fetchone(): return await m.answer("🌫 Команда существует!")
-        await db.execute("INSERT INTO custom_commands VALUES (?,?,?)", (m.chat.id, cn, ct))
-        await db.commit()
-    await try_delete(m)
-    await m.answer(f"🌸 РП-команда «<b>{cn}</b>» создана!", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^\-команда\s+(\S+)$"))
-async def del_custom_cmd(m: types.Message):
-    cn = re.match(r"^\-команда\s+(\S+)$", m.text, re.I).group(1).lower().strip()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM custom_commands WHERE chat_id=? AND cmd_name=?", (m.chat.id, cn))
-        await db.commit()
-    await try_delete(m)
-    await m.answer(f"🌸 РП-команда «<b>{cn}</b>» удалена.", parse_mode=ParseMode.HTML)
-
-@dp.message(F.text.regexp(r"(?i)^(список команд|команды|рп команды)$"))
-async def list_custom_cmds(m: types.Message):
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT cmd_name FROM custom_commands WHERE chat_id=?", (m.chat.id,)) as cur: rows = await cur.fetchall()
-    if not rows: return await m.answer("🌈 Нет кастомных РП-команд.")
-    await try_delete(m)
-    await m.answer(f"🌈 <b>Кастомные РП-команды:</b>\n" + ", ".join([f"<code>{r[0]}</code>" for r in rows]), parse_mode=ParseMode.HTML)
-
-@dp.message(F.chat.type.in_(["group", "supergroup"]))
-async def process_custom_rp(m: types.Message):
-    if not m.from_user or m.from_user.is_bot or not (m.text or m.caption): return
-    fw = (m.text or m.caption).strip().split()[0].lower()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT cmd_text FROM custom_commands WHERE chat_id=? AND cmd_name=?", (m.chat.id, fw)) as cur:
-            row = await cur.fetchone()
-            if row:
-                c_name = await get_disp_name(m.chat.id, m.from_user)
-                r_name = await get_disp_name(m.chat.id, m.reply_to_message.from_user) if (m.reply_to_message and m.reply_to_message.from_user) else "Никто"
-                r_msg = (m.reply_to_message.text or m.reply_to_message.caption or "") if m.reply_to_message else ""
-                rnd_name = "Случайный Гость"
-                async with db.execute("SELECT user_id FROM users WHERE chat_id=? ORDER BY RANDOM() LIMIT 1", (m.chat.id,)) as rcur:
-                    rrow = await rcur.fetchone()
-                    if rrow:
-                        try: rnd_name = await get_disp_name(m.chat.id, (await bot.get_chat_member(m.chat.id, rrow[0])).user)
-                        except: pass
-                res = row[0]
-                for p, v in {r"\{user\}": c_name, r"\{username\}": c_name, r"\{reply\}": r_name, r"\{reply_message\}": r_msg, r"\{random\}": rnd_name}.items(): res = re.sub(p, v, res, flags=re.I)
-                await try_delete(m)
-                await m.answer(f"🌈 {res}", parse_mode=ParseMode.HTML)
-
-@dp.message(Command("backup"))
-async def cmd_backup(m: types.Message):
-    if not STORAGE_GROUP_ID or str(m.chat.id) != str(STORAGE_GROUP_ID).strip(): return
-    try:
-        if (await bot.get_chat_member(m.chat.id, m.from_user.id)).status != ChatMemberStatus.CREATOR: return await m.answer("🌫 Только Создатель!")
-    except: return
-    msg = await m.answer("🔄 Выгружаю бэкап...")
-    fn = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    try:
-        data = {}
-        async with aiosqlite.connect(DB_PATH) as db:
-            db.row_factory = aiosqlite.Row
-            for t in ["users", "roles_custom", "rules_chapters", "rules_items", "custom_commands", "cmd_levels"]:
-                async with db.execute(f"SELECT * FROM {t}") as cur: data[t] = [dict(r) for r in await cur.fetchall()]
-        with open(fn, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=4)
-        await m.answer_document(FSInputFile(fn), caption=f"📦 <b>Бэкап сформирован!</b>\n📅 {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}", parse_mode=ParseMode.HTML)
-        await msg.delete()
-    except Exception as e: await m.answer(f"⚠️ Ошибка: <code>{e}</code>", parse_mode=ParseMode.HTML)
-    finally:
-        if os.path.exists(fn): os.remove(fn)
+        res = cmd[0]
+        for pat, val in {r"\{user\}": sender, r"\{username\}": sender, r"\{reply\}": reply_user, r"\{reply_message\}": reply_txt, r"\{random\}": rand_user}.items():
+            res = re.sub(pat, val, res, flags=re.I)
+        await m.answer(res)
 
 async def main():
-    await init_db()
-    dp.message.outer_middleware(ActivityMiddleware())
-    logging.basicConfig(level=logging.INFO)
-    print("🌸 Бот успешно запущен!")
+    logging.info("🚀 Восстановление из Telegram...")
+    await restore_from_telegram()
+    logging.info("🧪 Отправка автобэкапа...")
+    await backup_to_telegram()
+    logging.info("🌸 Запуск бота...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
