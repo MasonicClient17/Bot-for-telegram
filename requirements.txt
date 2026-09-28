@@ -1,4 +1,5 @@
 aiogram>=3.0.0
 python-dotenv
 psycopg2-binary
+aiosqlite
 
