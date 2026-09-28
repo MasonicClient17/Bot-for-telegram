@@ -10,7 +10,7 @@ from typing import Optional
 import aiosqlite
 from dotenv import load_dotenv
 
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.enums import ChatMemberStatus, ParseMode
 from aiogram.filters import Command
 from aiogram.types import ChatPermissions, FSInputFile
@@ -19,6 +19,12 @@ from aiogram.types import ChatPermissions, FSInputFile
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 STORAGE_GROUP_ID = os.getenv("STORAGE_GROUP_ID")
+
+if BOT_TOKEN:
+    BOT_TOKEN = BOT_TOKEN.strip().strip('"').strip("'")
+
+if STORAGE_GROUP_ID:
+    STORAGE_GROUP_ID = STORAGE_GROUP_ID.strip().strip('"').strip("'")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в переменных окружения!")
@@ -61,6 +67,19 @@ SYSTEM_RESERVED_WORDS = list(DEFAULT_CMD_LEVELS.keys()) + [
     "+ник", "-ник", "+команда", "-команда", "список команд", "команды",
     "рп команды", "+роль", "сменить"
 ]
+
+# --- Middleware подсчета активности ---
+
+class ActivityMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event: types.Message, data: dict):
+        if isinstance(event, types.Message) and event.from_user and not event.from_user.is_bot and event.chat.type in ["group", "supergroup"]:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("""
+                    INSERT INTO users (chat_id, user_id, msg_count) VALUES (?, ?, 1)
+                    ON CONFLICT(chat_id, user_id) DO UPDATE SET msg_count = msg_count + 1
+                """, (event.chat.id, event.from_user.id))
+                await db.commit()
+        return await handler(event, data)
 
 # --- База данных ---
 
@@ -183,66 +202,6 @@ async def resolve_target_user(message: types.Message) -> Optional[types.User]:
         if entity.type == "text_mention":
             return entity.user
     return None
-
-# --- Хэндлер активностей и кастомных РП-команд ---
-
-@dp.message(F.chat.type.in_(["group", "supergroup"]))
-async def track_activity_and_custom_rp(message: types.Message):
-    if not message.from_user or message.from_user.is_bot:
-        return
-
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    # Инкремент сообщений
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO users (chat_id, user_id, msg_count) VALUES (?, ?, 1)
-            ON CONFLICT(chat_id, user_id) DO UPDATE SET msg_count = msg_count + 1
-        """, (chat_id, user_id))
-        await db.commit()
-
-    text = (message.text or message.caption or "").strip()
-    if not text:
-        return
-
-    # Проверка вызова кастомных РП-команд
-    first_word = text.split()[0].lower()
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT cmd_text FROM custom_commands WHERE chat_id = ? AND cmd_name = ?",
-            (chat_id, first_word)
-        ) as cursor:
-            row = await cursor.fetchone()
-            if row:
-                template = row[0]
-                caller_name = await get_display_name(chat_id, message.from_user)
-                
-                reply_name = "Никто"
-                reply_msg = ""
-                if message.reply_to_message and message.reply_to_message.from_user:
-                    reply_name = await get_display_name(chat_id, message.reply_to_message.from_user)
-                    reply_msg = message.reply_to_message.text or ""
-
-                random_name = "Случайный Гость"
-                async with db.execute(
-                    "SELECT user_id FROM users WHERE chat_id = ? ORDER BY RANDOM() LIMIT 1", (chat_id,)
-                ) as r_cursor:
-                    r_row = await r_cursor.fetchone()
-                    if r_row:
-                        try:
-                            r_member = await bot.get_chat_member(chat_id, r_row[0])
-                            random_name = await get_display_name(chat_id, r_member.user)
-                        except Exception:
-                            pass
-
-                res_text = template.format(
-                    Username=caller_name,
-                    Reply=reply_name,
-                    Reply_message=reply_msg,
-                    Random=random_name
-                )
-                await message.answer(f"🌈 {res_text}", parse_mode=ParseMode.HTML)
 
 # --- Настройка уровней доступа (`сменить`) ---
 
@@ -764,6 +723,56 @@ async def list_custom_cmds(message: types.Message):
     cmds = ", ".join([f"<code>{r[0]}</code>" for r in rows])
     await message.answer(f"🌈 <b>Кастомные РП-команды чата:</b>\n{cmds}", parse_mode=ParseMode.HTML)
 
+# --- Обработка кастомных РП-команд (ФОЛЛБЕК — стоит НИЖЕ системных команд) ---
+
+@dp.message(F.chat.type.in_(["group", "supergroup"]))
+async def process_custom_rp(message: types.Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
+
+    text = (message.text or message.caption or "").strip()
+    if not text:
+        return
+
+    chat_id = message.chat.id
+    first_word = text.split()[0].lower()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT cmd_text FROM custom_commands WHERE chat_id = ? AND cmd_name = ?",
+            (chat_id, first_word)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                template = row[0]
+                caller_name = await get_display_name(chat_id, message.from_user)
+                
+                reply_name = "Никто"
+                reply_msg = ""
+                if message.reply_to_message and message.reply_to_message.from_user:
+                    reply_name = await get_display_name(chat_id, message.reply_to_message.from_user)
+                    reply_msg = message.reply_to_message.text or ""
+
+                random_name = "Случайный Гость"
+                async with db.execute(
+                    "SELECT user_id FROM users WHERE chat_id = ? ORDER BY RANDOM() LIMIT 1", (chat_id,)
+                ) as r_cursor:
+                    r_row = await r_cursor.fetchone()
+                    if r_row:
+                        try:
+                            r_member = await bot.get_chat_member(chat_id, r_row[0])
+                            random_name = await get_display_name(chat_id, r_member.user)
+                        except Exception:
+                            pass
+
+                res_text = template.format(
+                    Username=caller_name,
+                    Reply=reply_name,
+                    Reply_message=reply_msg,
+                    Random=random_name
+                )
+                await message.answer(f"🌈 {res_text}", parse_mode=ParseMode.HTML)
+
 # --- Выгрузка бэкапа в JSON ---
 
 async def export_db_to_dict() -> dict:
@@ -782,11 +791,9 @@ async def export_db_to_dict() -> dict:
 
 @dp.message(Command("backup"))
 async def cmd_backup(message: types.Message):
-    # 1. Проверка совпадения STORAGE_GROUP_ID
     if not STORAGE_GROUP_ID or str(message.chat.id) != str(STORAGE_GROUP_ID).strip():
         return
 
-    # 2. Проверка: вызывать может только Создатель группы
     try:
         chat_member = await bot.get_chat_member(message.chat.id, message.from_user.id)
         if chat_member.status != ChatMemberStatus.CREATOR:
@@ -798,12 +805,10 @@ async def cmd_backup(message: types.Message):
     backup_filename = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
     try:
-        # Сериализуем данные из SQLite в .json
         data = await export_db_to_dict()
         with open(backup_filename, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
 
-        # Отправляем файл в хранилище
         document = FSInputFile(backup_filename)
         await message.answer_document(
             document=document,
@@ -816,7 +821,6 @@ async def cmd_backup(message: types.Message):
         await message.answer(f"⚠️ Ошибка при формировании бэкапа: <code>{e}</code>", parse_mode=ParseMode.HTML)
 
     finally:
-        # Очищаем временный файл
         if os.path.exists(backup_filename):
             os.remove(backup_filename)
 
@@ -824,6 +828,10 @@ async def cmd_backup(message: types.Message):
 
 async def main():
     await init_db()
+    
+    # Подключаем middleware учета активности
+    dp.message.outer_middleware(ActivityMiddleware())
+    
     logging.basicConfig(level=logging.INFO)
     print("🌸 Бот успешно запущен!")
     await dp.start_polling(bot)
