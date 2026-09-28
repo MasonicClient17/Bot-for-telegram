@@ -7,7 +7,7 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", 0))
 
-bot = Bot(token=BOT_TOKEN)
+token = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 DB_FILE = "bot_database.db"
 
