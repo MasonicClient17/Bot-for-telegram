@@ -134,7 +134,7 @@ async def check_access(m: types.Message, cmd: str) -> bool:
     req = get_req_lvl(m.chat.id, cmd)
     u_lvl = await get_user_lvl(m.chat.id, m.from_user.id)
     if u_lvl < req:
-        await m.answer(f"🌫 Недостаточно уровня допуска! Требуется: {req} ({LEVEL_NAMES.get(req, '')}).")
+        await m.answer(f"🌫 Ваше влияние недостаточно велико! Требуется: {req} ({LEVEL_NAMES.get(req, '')}).")
         return False
     return True
 
@@ -158,7 +158,7 @@ def parse_mod_args(text: str, target_str: str, prefixes: list):
             n, u = int(m.group(1)), m.group(2) or "мин"
             mins = n * 60 if u.startswith("ч") else (n * 1440 if u.startswith("д") else n)
             words = words[1:]
-    reason = " ".join(words).strip()
+    reason = ".".join(words).strip()
     return mins, (f"\n📝 **Причина:** {reason}" if reason else "")
 
 async def resolve_target(m: types.Message):
@@ -265,17 +265,17 @@ async def mute_handler(m: types.Message):
     if not await check_access(m, "напоить сиропом"): return
     tid, tname, tstr = await resolve_target(m)
     if not tid:
-        return await m.answer("🫗 Ответьте на сообщение пользователя!")
+        return await m.answer("🌸 Ответьте на сообщение пользователя!")
     await try_delete(m)
     if m.text.lower().startswith("дать воды"):
         try:
             await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True))
-            return await m.answer(f"🥛 Пользователь **{tname}** получил воды. Мут снят!")
+            return await m.answer(f"🥛 {tname} получил(а) воды!")
         except Exception as e: return await m.answer(f"👁 Ошибка: {e}")
     mins, r_str = parse_mod_args(m.text, tstr, ["напоить сиропом", "клиновый сироп"])
     try:
         await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=False), until_date=int(datetime.now().timestamp()) + mins*60)
-        await m.answer(f"🥛 **{tname}** отправлен молчать на {mins} мин.{r_str}")
+        await m.answer(f"🫗 **{tname}** отправлен молчать на {mins} мин.{r_str}")
     except Exception as e: await m.answer(f"👁 Ошибка: {e}")
 
 @dp.message(F.text.lower().startswith("дать плод всей боли"))
@@ -283,11 +283,11 @@ async def mute_24h_handler(m: types.Message):
     if not await check_access(m, "дать плод всей боли"): return
     tid, tname, _ = await resolve_target(m)
     if not tid:
-        return await m.answer("🫗 Ответьте на сообщение пользователя!")
+        return await m.answer("🌸 Ответьте на сообщение пользователя!")
     reason = m.text[19:].strip() or "Не указана"
     try:
         await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=False), until_date=int(datetime.now().timestamp()) + 86400)
-        await try_delete(m); await m.answer(f"🍇 Пользователь **{tname}** вкусил плод всей боли (мут на 24 часа).\nПричина: {reason}")
+        await try_delete(m); await m.answer(f"🍇 {tname} вкусил(а) плод всей боли...\nПричина: {reason}")
     except Exception as e: await m.answer(f"👁 Ошибка: {e}")
 
 @dp.message(F.text.lower().startswith(("в банку", "банка с джемом")))
@@ -299,7 +299,7 @@ async def ban_handler(m: types.Message):
     reason = re.sub(r"^(в банку|банка с джемом)", "", m.text, flags=re.I).strip() or "Не указана"
     try:
         await m.chat.ban(tid); await try_delete(m)
-        await m.answer(f"🫙 Пользователь **{tname}** запечатан в банку с джемом (забанен).\nПричина: {reason}")
+        await m.answer(f"🫙 {tname} запечатан(а) в банку с джемом.\nПричина: {reason}")
     except Exception as e: await m.answer(f"👁 Ошибка: {e}")
 
 @dp.message(F.text.lower().startswith("вытащить из банки"))
@@ -307,10 +307,10 @@ async def unban_handler(m: types.Message):
     if not await check_access(m, "в банку"): return
     tid, tname, _ = await resolve_target(m)
     if not tid:
-        return await m.answer("🫗 Ответьте на сообщение пользователя!")
+        return await m.answer("🌸 Ответьте на сообщение пользователя!")
     try:
         await m.chat.unban(tid, only_if_banned=True); await try_delete(m)
-        await m.answer(f"🌸 Пользователь **{tname}** извлечен из банки (разбанен)!")
+        await m.answer(f"🌸 {tname} достали из банки!")
     except Exception as e: await m.answer(f"👁 Ошибка: {e}")
 
 @dp.message(F.text.startswith(("+устав", "+правила")))
@@ -350,12 +350,12 @@ async def view_rules_handler(m: types.Message):
         return await m.answer(f"📜 **Правило {sec}.{itm}: {res[0]}**\n\n{res[1]}" if res else f"🫙 Правило {sec}.{itm} не найдено!", parse_mode="Markdown")
     if arg.isdigit():
         items = db_query("SELECT item, title, content FROM rules WHERE chat_id=? AND section=? ORDER BY item ASC", (m.chat.id, int(arg)), fetchall=True)
-        if not items: return await m.answer(f"🫙 Раздел {arg} не найден!")
+        if not items: return await m.answer(f"👁️ Раздел {arg} не найден!")
         stitle = items[0][1] if items[0][0] == 0 else f"Раздел {arg}"
         txt = f"📜 **Раздел {arg}. {stitle}**\n\n" + "\n\n".join([f"**{arg}.{i} {t}**\n{c}" for i, t, c in items if i != 0])
         return await m.answer(txt, parse_mode="Markdown")
     all_rules = db_query("SELECT section, item, title, content FROM rules WHERE chat_id=? ORDER BY section ASC, item ASC", (m.chat.id,), fetchall=True)
-    if not all_rules: return await m.answer("🫙 Устав ещё пуст!")
+    if not all_rules: return await m.answer("👁️ Устав ещё пуст!")
     txt, cur_sec = "📜 **Устав / Правила чата:**\n\n", None
     for sec, itm, title, content in all_rules:
         if sec != cur_sec:
@@ -384,7 +384,7 @@ async def rem_nick(m: types.Message):
         return await m.answer("🌫 Сбрасывать ники другим могут только модераторы.")
     db_query("UPDATE users SET rp_name=NULL WHERE chat_id=? AND user_id=?", (m.chat.id, tid), commit=True)
     schedule_sync(); await try_delete(m)
-    await m.answer(f"🗑 РП-ник **{tname}** сброшен.")
+    await m.answer(f"🏷 ник {tname} сброшен.")
 
 @dp.message(F.text.startswith(("+команда", "+комманда")))
 async def add_cmd(m: types.Message):
@@ -392,12 +392,12 @@ async def add_cmd(m: types.Message):
     if len(p) < 3: return await m.answer("Использование: `+команда [имя] [текст]`", parse_mode="Markdown")
     cn = p[1].lower().strip()
     if any(re.fullmatch(pat, cn) for pat in FORBIDDEN_PATTERNS):
-        return await m.answer("⚠️ Совпадает с системной командой.")
+        return await m.answer("👁️ Совпадает с системной командой.")
     if db_query("SELECT command_name FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, cn), fetchone=True):
-        return await m.answer(f"⚠️ Команда `{cn}` уже существует!")
+        return await m.answer(f"👁️ Команда `{cn}` уже существует!")
     db_query("INSERT INTO custom_commands VALUES (?,?,?)", (m.chat.id, cn, p[2]), commit=True)
     schedule_sync(); await try_delete(m)
-    await m.answer(f"🌸 РП-команда `{cn}` сохранена!", parse_mode="Markdown")
+    await m.answer(f"🌸 `{cn}` сохранена!", parse_mode="Markdown")
 
 @dp.message(F.text.startswith(("-команда", "-комманда")))
 async def del_cmd(m: types.Message):
@@ -406,7 +406,7 @@ async def del_cmd(m: types.Message):
     cn = p[1].lower().strip()
     db_query("DELETE FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, cn), commit=True)
     schedule_sync(); await try_delete(m)
-    await m.answer(f"🗑 Команда `{cn}` удалена!")
+    await m.answer(f"🌸 `{cn}` удалена!")
 
 @dp.message(F.text.lower().in_(["список команд", "команды", "рп команды"]))
 async def list_cmds(m: types.Message):
