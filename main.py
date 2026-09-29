@@ -158,7 +158,7 @@ def parse_mod_args(text: str, target_str: str, prefixes: list):
             n, u = int(m.group(1)), m.group(2) or "мин"
             mins = n * 60 if u.startswith("ч") else (n * 1440 if u.startswith("д") else n)
             words = words[1:]
-    reason = ".".join(words).strip()
+    reason = " ".join(words).strip()
     return mins, (f"\n📝 **Причина:** {reason}" if reason else "")
 
 async def resolve_target(m: types.Message):
@@ -238,7 +238,7 @@ async def call_all_handler(m: types.Message):
     if not members:
         return await m.answer("🫙 В базе пока нет записанных участников!")
     reason = re.sub(r"^(калл|call|созыв)", "", m.text, flags=re.I).strip()
-    hdr = f"🌈 Общий сбор!\nПричина: {reason}\n\n" if reason else "🌈 Общий сбор!\n\n"
+    hdr = f"🌈 Общий сбор!\n{reason}\n\n" if reason else "🌈 Общий сбор!\n\n"
     mentions, emo_cycle = [], itertools.cycle(CALL_EMOJIS)
     for (uid,) in members:
         mentions.append(f'<a href="tg://user?id={uid}">{next(emo_cycle)}</a>')
@@ -275,7 +275,7 @@ async def mute_handler(m: types.Message):
     mins, r_str = parse_mod_args(m.text, tstr, ["напоить сиропом", "клиновый сироп"])
     try:
         await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=False), until_date=int(datetime.now().timestamp()) + mins*60)
-        await m.answer(f"🫗 **{tname}** отправлен молчать на {mins} мин.{r_str}")
+        await m.answer(f"🫗 {tname} отправлен молчать на {mins} мин.{r_str}")
     except Exception as e: await m.answer(f"👁 Ошибка: {e}")
 
 @dp.message(F.text.lower().startswith("дать плод всей боли"))
