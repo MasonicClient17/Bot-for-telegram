@@ -12,11 +12,10 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 DB_FILE = "bot_database.db"
 
-# Набор эмодзи для маскировки ссылок в команде созыва
 CALL_EMOJIS = ["🌸", "☁️", "👁", "🐍", "🌫", "🥛", "🫗", "🍨", "🍧", "🌈", "🍇", "🫙"]
 
-# Дефолтные уровни доступа к командам
 DEFAULT_CMD_LEVELS = {
+    "кто я": 0, "профиль": 0,
     "калл": 0, "call": 0, "созыв": 0,
     "устав": 0, "правила": 0,
     "клиновый сироп": 1, "напоить сиропом": 1, "дать воды": 1, "дать плод всей боли": 1,
@@ -32,7 +31,7 @@ LEVEL_NAMES = {0: "Участник", 1: "Хелпер", 2: "Модератор"
 FORBIDDEN_PATTERNS = [
     r"правила.*", r"устав.*", r"актив.*", r"стата.*", r"варн.*", r"отругать.*",
     r"банка.*", r"сироп.*", r"воды.*", r"плод.*", r"ники.*", r"звания.*",
-    r"команды.*", r"повысить.*", r"понизить.*", r"сменить.*", r"приветствие.*"
+    r"команды.*", r"повысить.*", r"понизить.*", r"сменить.*", r"приветствие.*", r"профиль.*", r"кто я.*"
 ]
 
 def db_query(sql, params=(), fetchone=False, fetchall=False, commit=False):
@@ -45,7 +44,7 @@ def db_query(sql, params=(), fetchone=False, fetchall=False, commit=False):
 
 def init_db():
     queries = [
-        "CREATE TABLE IF NOT EXISTS users (chat_id INT, user_id INT, role_level INT DEFAULT 0, warns INT DEFAULT 0, msg_count INT DEFAULT 0, rp_name TEXT, PRIMARY KEY (chat_id, user_id));",
+        "CREATE TABLE IF NOT EXISTS users (chat_id INT, user_id INT, role_level INT DEFAULT 0, warns INT DEFAULT 0, msg_count INT DEFAULT 0, rp_name TEXT, day_count INT DEFAULT 0, week_count INT DEFAULT 0, last_msg_date TEXT, week_number TEXT, joined_at TEXT, PRIMARY KEY (chat_id, user_id));",
         "CREATE TABLE IF NOT EXISTS custom_commands (chat_id INT, command_name TEXT, response_text TEXT, PRIMARY KEY (chat_id, command_name));",
         "CREATE TABLE IF NOT EXISTS mod_roles (chat_id INT, user_id INT, role_level INT DEFAULT 0, PRIMARY KEY (chat_id, user_id));",
         "CREATE TABLE IF NOT EXISTS role_names (chat_id INT PRIMARY KEY, r1 TEXT DEFAULT 'Хелпер', r2 TEXT DEFAULT 'Модер', r3 TEXT DEFAULT 'Админ');",
@@ -56,6 +55,12 @@ def init_db():
     ]
     for q in queries:
         db_query(q, commit=True)
+    
+    # Авто-миграция колонок, если структура старая
+    cols = [r[1] for r in db_query("PRAGMA table_info(users)", fetchall=True)]
+    for col, col_type in [("day_count", "INT DEFAULT 0"), ("week_count", "INT DEFAULT 0"), ("last_msg_date", "TEXT"), ("week_number", "TEXT"), ("joined_at", "TEXT")]:
+        if col not in cols:
+            db_query(f"ALTER TABLE users ADD COLUMN {col} {col_type};", commit=True)
 
 init_db()
 
@@ -70,7 +75,7 @@ async def backup_to_telegram():
     data = {
         "rules": db_query("SELECT chat_id, section, item, title, content FROM rules", fetchall=True),
         "custom_commands": db_query("SELECT chat_id, command_name, response_text FROM custom_commands", fetchall=True),
-        "users": db_query("SELECT chat_id, user_id, role_level, rp_name, warns FROM users", fetchall=True),
+        "users": db_query("SELECT chat_id, user_id, role_level, rp_name, warns, day_count, week_count, last_msg_date, week_number, joined_at FROM users", fetchall=True),
         "mod_roles": db_query("SELECT chat_id, user_id, role_level FROM mod_roles", fetchall=True),
         "cmd_levels": db_query("SELECT chat_id, cmd_name, min_lvl FROM cmd_levels", fetchall=True),
         "welcome": db_query("SELECT chat_id, welcome_text FROM welcome_messages", fetchall=True)
@@ -101,11 +106,13 @@ async def restore_from_telegram():
         data = json.loads((await bot.download_file(finfo.file_path)).read().decode('utf-8'))
         for r in data.get("rules", []): db_query("INSERT OR REPLACE INTO rules VALUES (?,?,?,?,?)", tuple(r), commit=True)
         for c in data.get("custom_commands", []): db_query("INSERT OR REPLACE INTO custom_commands VALUES (?,?,?)", tuple(c), commit=True)
-        for u in data.get("users", []): 
+        for u in data.get("users", []):
             if len(u) == 4:
                 db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name) VALUES (?,?,?,?)", tuple(u), commit=True)
             elif len(u) == 5:
                 db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name, warns) VALUES (?,?,?,?,?)", tuple(u), commit=True)
+            elif len(u) >= 10:
+                db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name, warns, day_count, week_count, last_msg_date, week_number, joined_at) VALUES (?,?,?,?,?,?,?,?,?,?)", tuple(u[:10]), commit=True)
         for cl in data.get("cmd_levels", []): db_query("INSERT OR REPLACE INTO cmd_levels VALUES (?,?,?)", tuple(cl), commit=True)
         for w in data.get("welcome", []): db_query("INSERT OR REPLACE INTO welcome_messages VALUES (?,?)", tuple(w), commit=True)
         logging.info("[RESTORE] Восстановлено успешно!")
@@ -200,21 +207,65 @@ async def resolve_target(m: types.Message):
     return None, None, None
 
 def track_user(cid: int, uid: int, fname: str, username: str = None):
-    if uid and uid != bot.id:
-        un = username.lower() if username else ""
-        db_query("INSERT INTO chat_members VALUES (?,?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET first_name=excluded.first_name, username=excluded.username", (cid, uid, fname, un), commit=True)
-        db_query("INSERT INTO users (chat_id, user_id, msg_count) VALUES (?,?,1) ON CONFLICT(chat_id, user_id) DO UPDATE SET msg_count=msg_count+1", (cid, uid), commit=True)
+    if not uid or uid == bot.id:
+        return
+    un = username.lower() if username else ""
+    db_query("INSERT INTO chat_members VALUES (?,?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET first_name=excluded.first_name, username=excluded.username", (cid, uid, fname, un), commit=True)
+    
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    iso_year, iso_week, _ = now.isocalendar()
+    week_str = f"{iso_year}-{iso_week}"
+    
+    user_data = db_query("SELECT day_count, week_count, last_msg_date, week_number, joined_at FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
+    
+    if not user_data:
+        db_query("INSERT INTO users (chat_id, user_id, msg_count, day_count, week_count, last_msg_date, week_number, joined_at) VALUES (?,?,1,1,1,?,?,?)", (cid, uid, today_str, week_str, today_str), commit=True)
+    else:
+        day_c, week_c, last_date, last_week, joined = user_data
+        
+        new_day_c = 1 if last_date != today_str else (day_c or 0) + 1
+        new_week_c = 1 if last_week != week_str else (week_c or 0) + 1
+        new_joined = joined or today_str
+        
+        db_query("""
+            INSERT INTO users (chat_id, user_id, msg_count, day_count, week_count, last_msg_date, week_number, joined_at) 
+            VALUES (?,?,1,?,?,?,?,?) 
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET 
+                msg_count=users.msg_count+1, 
+                day_count=?, 
+                week_count=?, 
+                last_msg_date=?, 
+                week_number=?, 
+                joined_at=?
+        """, (cid, uid, new_day_c, new_week_c, today_str, week_str, new_joined, new_day_c, new_week_c, today_str, week_str, new_joined), commit=True)
+
+def get_user_stats(cid: int, uid: int):
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    iso_year, iso_week, _ = now.isocalendar()
+    week_str = f"{iso_year}-{iso_week}"
+    
+    data = db_query("SELECT day_count, week_count, last_msg_date, week_number, joined_at FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
+    if not data:
+        return 0, 0, today_str
+    
+    day_c, week_c, last_date, last_week, joined = data
+    real_day = day_c if last_date == today_str else 0
+    real_week = week_c if last_week == week_str else 0
+    real_joined = joined or today_str
+    
+    return real_day, real_week, real_joined
 
 # ==================== ПРИВЕТСТВИЕ ====================
 
 @dp.message(F.new_chat_members)
 async def welcome_new_members(m: types.Message):
     res = db_query("SELECT welcome_text FROM welcome_messages WHERE chat_id=?", (m.chat.id,), fetchone=True)
-    if not res or not res[0]:
-        return
     for user in m.new_chat_members:
         if user.is_bot: continue
         track_user(m.chat.id, user.id, user.first_name, user.username)
+        if not res or not res[0]: continue
         uname = get_name(m.chat.id, user.id, user.first_name)
         txt = res[0]
         for pat, val in {r"\{user\}": uname, r"\{chat\}": m.chat.title or "Сад"}.items():
@@ -244,6 +295,48 @@ async def show_welcome(m: types.Message):
     if not res or not res[0]:
         return await m.answer("🫙 Приветствие в этом чате не установлено.")
     await m.answer(f"🌸 **Текущее приветствие:**\n\n{res[0]}", parse_mode="Markdown")
+
+# ==================== ПРОФИЛЬ ====================
+
+@dp.message(F.text.lower().in_(["кто я", "профиль"]))
+async def user_profile_handler(m: types.Message):
+    if not await check_access(m, "кто я"): return
+    
+    tid, tname, _ = await resolve_target(m)
+    if not tid:
+        tid = m.from_user.id
+        tname = get_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+    
+    day_cnt, week_cnt, joined_date = get_user_stats(m.chat.id, tid)
+    
+    same_count = (day_cnt == week_cnt)
+    
+    # Стилистика по условию
+    if week_cnt <= 10:
+        msg = f"🌸 Похоже {tname} немногословна~ всего **{week_cnt}** сообщений в этой неделе."
+        if not same_count:
+            msg += f" А сегодня **{day_cnt}**."
+    elif 11 <= week_cnt <= 30:
+        msg = f"🌸 У этой мультяшки всего **{week_cnt}** сообщений за неделю~."
+        if not same_count:
+            msg += f" За сегодня **{day_cnt}**."
+    elif 31 <= week_cnt <= 70:
+        msg = f"🌸 Ох~ у этой мультяшки **{week_cnt}** сообщений за эту неделю."
+        if not same_count:
+            msg += f" А за сегодня **{day_cnt}**~"
+    elif 71 <= week_cnt <= 100:
+        msg = f"🌸 Ого, у этой мультяшки **{week_cnt}** сообщений за эту неделю!~\n{tname}, вы молодец!"
+        if not same_count:
+            msg += f"\nА за сегодня **{day_cnt}** сообщений."
+    else: # 100+
+        msg = f"🌸 Вот это да~ **{week_cnt}** сообщений в неделю 👏🏻👏🏻\n{tname}, вы молодец!✨"
+        if not same_count:
+            msg += f"\nСегодня **{day_cnt}** сообщений."
+            
+    msg += f"\n\n✨ присоединилась к саду: **{joined_date}**"
+    
+    await try_delete(m)
+    await m.answer(msg, parse_mode="Markdown")
 
 # ==================== ОСНОВНЫЕ КОМАНДЫ ====================
 
@@ -436,7 +529,7 @@ async def view_rules_handler(m: types.Message):
         return await m.answer(f"📜 **Правило {sec}.{itm}: {res[0]}**\n\n{res[1]}" if res else f"🫙 Правило {sec}.{itm} не найдено!", parse_mode="Markdown")
     if arg.isdigit():
         items = db_query("SELECT item, title, content FROM rules WHERE chat_id=? AND section=? ORDER BY item ASC", (m.chat.id, int(arg)), fetchall=True)
-        if not items: return await m.answer(f"👁️ Раздел {arg} не найден!")
+        if not items: return await m.answer(f"👁️️ Раздел {arg} не найден!")
         stitle = items[0][1] if items[0][0] == 0 else f"Раздел {arg}"
         txt = f"📜 **Раздел {arg}. {stitle}**\n\n" + "\n\n".join([f"**{arg}.{i} {t}**\n{c}" for i, t, c in items if i != 0])
         return await m.answer(txt, parse_mode="Markdown")
@@ -480,7 +573,7 @@ async def add_cmd(m: types.Message):
     if any(re.fullmatch(pat, cn) for pat in FORBIDDEN_PATTERNS):
         return await m.answer("👁️ Совпадает с системной командой.")
     if db_query("SELECT command_name FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, cn), fetchone=True):
-        return await m.answer(f"👁️️ Команда `{cn}` уже существует!")
+        return await m.answer(f"👁 Команда `{cn}` уже существует!")
     db_query("INSERT INTO custom_commands VALUES (?,?,?)", (m.chat.id, cn, p[2]), commit=True)
     schedule_sync(); await try_delete(m)
     await m.answer(f"🌸 `{cn}` сохранена!", parse_mode="Markdown")
@@ -517,8 +610,23 @@ async def process_msg(m: types.Message):
         users = db_query("SELECT user_id, first_name FROM chat_members WHERE chat_id=?", (m.chat.id,), fetchall=True)
         rand_user = get_name(m.chat.id, *random.choice(users)) if users else "Кто-то"
 
+        # Статистика для автора и для цели ответа
+        s_day, s_week, _ = get_user_stats(m.chat.id, m.from_user.id)
+        r_day, r_week, _ = get_user_stats(m.chat.id, tid) if tid else (0, 0, "")
+
         res = cmd[0]
-        for pat, val in {r"\{user\}": sender, r"\{username\}": sender, r"\{reply\}": reply_user, r"\{reply_message\}": reply_txt, r"\{random\}": rand_user}.items():
+        replacements = {
+            r"\{user\}": sender, 
+            r"\{username\}": sender, 
+            r"\{reply\}": reply_user, 
+            r"\{reply_message\}": reply_txt, 
+            r"\{random\}": rand_user,
+            r"\{day\}": str(s_day),
+            r"\{week\}": str(s_week),
+            r"\{reply_day\}": str(r_day),
+            r"\{reply_week\}": str(r_week)
+        }
+        for pat, val in replacements.items():
             res = re.sub(pat, val, res, flags=re.I)
         await m.answer(res)
 
