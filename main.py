@@ -171,7 +171,6 @@ def get_user_tag(cid: int, uid: int) -> str:
     return res[0] if res and res[0] else ""
 
 def get_display_name(cid: int, uid: int, default_tg_name: str) -> str:
-    # Имя по приоритету: РП-ник -> РП-тэг -> first_name
     rp_nick = db_query("SELECT rp_name FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
     if rp_nick and rp_nick[0]:
         return rp_nick[0]
@@ -667,8 +666,8 @@ async def process_msg(m: types.Message):
     track_user(m.chat.id, m.from_user.id, m.from_user.first_name, m.from_user.username)
     t = m.text.lower().strip()
 
-    # --- МАГАЗИН (ПРОДАЖА) ---
-    shop_match = re.match(r"^(продам|продаю)\s+(.+?)\s+за\s+(.+)$", m.text.strip(), re.I)
+    # --- МАГАЗИН (ПРОДАЖА: продам/продаю/продать) ---
+    shop_match = re.match(r"^(продам|продаю|продать)\s+(.+?)\s+за\s+(.+)$", m.text.strip(), re.I)
     if shop_match:
         try:
             user_tag = get_user_tag(m.chat.id, m.from_user.id)
@@ -692,8 +691,8 @@ async def process_msg(m: types.Message):
             logging.error(f"[SHOP ERROR] {e}")
             return await m.answer("К сожалению, сейчас купля-продажа недоступна")
 
-    # --- МАГАЗИН (ПОКУПКА) ---
-    if t in ["покупаю", "купить"] and m.reply_to_message:
+    # --- МАГАЗИН (ПОКУПКА: ищет покупаю/купить в любом месте сообщения при ответе) ---
+    if m.reply_to_message and re.search(r"\b(покупаю|купить)\b", t, re.I):
         try:
             shop_data = active_shop_items.get(m.chat.id)
             if shop_data and shop_data["msg_id"] == m.reply_to_message.message_id:
