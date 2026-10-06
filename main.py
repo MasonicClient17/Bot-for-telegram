@@ -76,18 +76,19 @@ async def backup_to_telegram():
     data = {
         "rules": db_query("SELECT chat_id, section, item, title, content FROM rules", fetchall=True),
         "custom_commands": db_query("SELECT chat_id, command_name, response_text FROM custom_commands", fetchall=True),
-        "users": db_query("SELECT chat_id, user_id, role_level, rp_name, warns, day_count, week_count, last_msg_date, week_number, joined_at FROM users", fetchall=True),
+        "users": db_query("SELECT chat_id, user_id, role_level, rp_name, warns, msg_count, day_count, week_count, last_msg_date, week_number, joined_at FROM users", fetchall=True),
         "mod_roles": db_query("SELECT chat_id, user_id, role_level FROM mod_roles", fetchall=True),
         "cmd_levels": db_query("SELECT chat_id, cmd_name, min_lvl FROM cmd_levels", fetchall=True),
         "welcome": db_query("SELECT chat_id, welcome_text FROM welcome_messages", fetchall=True),
-        "user_tags": db_query("SELECT chat_id, user_id, tag_name FROM user_tags", fetchall=True)
+        "user_tags": db_query("SELECT chat_id, user_id, tag_name FROM user_tags", fetchall=True),
+        "chat_members": db_query("SELECT chat_id, user_id, first_name, username FROM chat_members", fetchall=True)
     }
     file = BufferedInputFile(json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'), filename="backup.json")
     try:
         msg = await bot.send_document(
             STORAGE_CHAT_ID,
             document=file,
-            caption=f"📦 **Бэкап БД** | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            caption=f"📦 **Бэкап БД (Полный)** | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         try:
             await bot.pin_chat_message(STORAGE_CHAT_ID, msg.message_id, disable_notification=True)
@@ -113,14 +114,25 @@ async def restore_from_telegram():
                 db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name) VALUES (?,?,?,?)", tuple(u), commit=True)
             elif len(u) == 5:
                 db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name, warns) VALUES (?,?,?,?,?)", tuple(u), commit=True)
+            elif len(u) >= 11:
+                db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name, warns, msg_count, day_count, week_count, last_msg_date, week_number, joined_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)", tuple(u[:11]), commit=True)
             elif len(u) >= 10:
                 db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name, warns, day_count, week_count, last_msg_date, week_number, joined_at) VALUES (?,?,?,?,?,?,?,?,?,?)", tuple(u[:10]), commit=True)
         for cl in data.get("cmd_levels", []): db_query("INSERT OR REPLACE INTO cmd_levels VALUES (?,?,?)", tuple(cl), commit=True)
         for w in data.get("welcome", []): db_query("INSERT OR REPLACE INTO welcome_messages VALUES (?,?)", tuple(w), commit=True)
         for ut in data.get("user_tags", []): db_query("INSERT OR REPLACE INTO user_tags VALUES (?,?,?)", tuple(ut), commit=True)
+        for cm in data.get("chat_members", []): db_query("INSERT OR REPLACE INTO chat_members VALUES (?,?,?,?)", tuple(cm), commit=True)
         logging.info("[RESTORE] Восстановлено успешно!")
     except Exception as e:
         logging.error(f"[RESTORE] Ошибка восстановления: {e}")
+
+# Команда /safe только для бэкап-чата
+@dp.message(F.text == "/safe")
+async def manual_safe_handler(m: types.Message):
+    if m.chat.id != STORAGE_CHAT_ID:
+        return
+    await backup_to_telegram()
+    await m.answer("📦 **Вся информация бота успешно сохранена!**", parse_mode="Markdown")
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
@@ -154,15 +166,12 @@ async def check_access(m: types.Message, cmd: str) -> bool:
         return False
     return True
 
-def get_name(cid: int, uid: int, default: str) -> str:
-    res = db_query("SELECT rp_name FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
-    return res[0] if res and res[0] else default
-
 def get_user_tag(cid: int, uid: int) -> str:
     res = db_query("SELECT tag_name FROM user_tags WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
     return res[0] if res and res[0] else ""
 
 def get_display_name(cid: int, uid: int, default_tg_name: str) -> str:
+    # Имя по приоритету: РП-ник -> РП-тэг -> first_name
     rp_nick = db_query("SELECT rp_name FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
     if rp_nick and rp_nick[0]:
         return rp_nick[0]
@@ -207,7 +216,7 @@ async def resolve_target(m: types.Message):
                 target_str = text[entity.offset:entity.offset + entity.length]
                 return u.id, fname, target_str
             elif entity.type == "mention":
-                raw_mention = text[entity.offset:entity.offset + entity.length]
+                raw_mention = text[entity.offset:offset + entity.length]
                 un = raw_mention.lstrip("@").lower().strip()
                 res = db_query("SELECT user_id, first_name FROM chat_members WHERE chat_id=? AND LOWER(username)=?", (m.chat.id, un), fetchone=True)
                 if res:
@@ -237,28 +246,27 @@ def track_user(cid: int, uid: int, fname: str, username: str = None):
     iso_year, iso_week, _ = now.isocalendar()
     week_str = f"{iso_year}-{iso_week}"
     
-    user_data = db_query("SELECT day_count, week_count, last_msg_date, week_number, joined_at FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
+    user_data = db_query("SELECT msg_count, day_count, week_count, last_msg_date, week_number, joined_at FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
     
     if not user_data:
         db_query("INSERT INTO users (chat_id, user_id, msg_count, day_count, week_count, last_msg_date, week_number, joined_at) VALUES (?,?,1,1,1,?,?,?)", (cid, uid, today_str, week_str, today_str), commit=True)
     else:
-        day_c, week_c, last_date, last_week, joined = user_data
-        
+        tot_cnt, day_c, week_c, last_date, last_week, joined = user_data
+        new_tot = (tot_cnt or 0) + 1
         new_day_c = 1 if last_date != today_str else (day_c or 0) + 1
         new_week_c = 1 if last_week != week_str else (week_c or 0) + 1
         new_joined = joined or today_str
         
         db_query("""
-            INSERT INTO users (chat_id, user_id, msg_count, day_count, week_count, last_msg_date, week_number, joined_at) 
-            VALUES (?,?,1,?,?,?,?,?) 
-            ON CONFLICT(chat_id, user_id) DO UPDATE SET 
-                msg_count=users.msg_count+1, 
+            UPDATE users SET 
+                msg_count=?, 
                 day_count=?, 
                 week_count=?, 
                 last_msg_date=?, 
                 week_number=?, 
                 joined_at=?
-        """, (cid, uid, new_day_c, new_week_c, today_str, week_str, new_joined, new_day_c, new_week_c, today_str, week_str, new_joined), commit=True)
+            WHERE chat_id=? AND user_id=?
+        """, (new_tot, new_day_c, new_week_c, today_str, week_str, new_joined, cid, uid), commit=True)
 
 def get_user_stats(cid: int, uid: int):
     now = datetime.now()
@@ -328,7 +336,6 @@ async def user_profile_handler(m: types.Message):
         tname = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
     
     day_cnt, week_cnt, joined_date = get_user_stats(m.chat.id, tid)
-    
     same_count = (day_cnt == week_cnt)
     
     if week_cnt <= 10:
@@ -660,50 +667,46 @@ async def process_msg(m: types.Message):
     track_user(m.chat.id, m.from_user.id, m.from_user.first_name, m.from_user.username)
     t = m.text.lower().strip()
 
-    # Продажа (магазин)
+    # --- МАГАЗИН (ПРОДАЖА) ---
     shop_match = re.match(r"^(продам|продаю)\s+(.+?)\s+за\s+(.+)$", m.text.strip(), re.I)
     if shop_match:
-        user_tag = get_user_tag(m.chat.id, m.from_user.id).lower()
-        if user_tag != "dandy":
-            return await m.answer("🌫 Только торговцы с тэгом Dandy могут продавать предметы!")
-            
-        item_name = shop_match.group(2).strip()
-        price = shop_match.group(3).strip()
-        seller_disp_name = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
-        
-        sent_msg = await m.answer(
-            f"🌸 **{seller_disp_name}** выставляет на продажу: **{item_name}** за **{price}**!\n"
-            f"Чтобы купить, ответьте на это сообщение текстом «покупаю» или «купить».",
-            parse_mode="Markdown"
-        )
-        active_shop_items[m.chat.id] = {
-            "seller_id": m.from_user.id,
-            "item_name": item_name,
-            "price": price,
-            "msg_id": sent_msg.message_id
-        }
-        return
+        try:
+            user_tag = get_user_tag(m.chat.id, m.from_user.id)
+            if user_tag.lower() != "dandy":
+                tag_display = user_tag if user_tag else "Dandy"
+                return await m.answer(f"🌫️Только торговец {tag_display} может продавать эти вещи")
 
-    # Покупка
-    if t in ["покупаю", "купить"] and m.reply_to_message:
-        shop_data = active_shop_items.get(m.chat.id)
-        if shop_data and shop_data["msg_id"] == m.reply_to_message.message_id:
-            seller_id = shop_data["seller_id"]
-            seller_member = db_query("SELECT first_name FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, seller_id), fetchone=True)
-            seller_tg_name = seller_member[0] if seller_member else "Продавец"
-            seller_disp_name = get_display_name(m.chat.id, seller_id, seller_tg_name)
-            
-            buyer_disp_name = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
-            
-            await m.answer(
-                f"🤝✨ **{buyer_disp_name}** успешно приобретает **{shop_data['item_name']}** "
-                f"у **{seller_disp_name}** за {shop_data['price']}!",
-                parse_mode="Markdown"
-            )
-            del active_shop_items[m.chat.id]
+            item_name = shop_match.group(2).strip()
+            price = shop_match.group(3).strip()
+            seller_nick = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+
+            sent_msg = await m.answer(f"🌸{seller_nick} выставляет на продажу {item_name}")
+            active_shop_items[m.chat.id] = {
+                "seller_id": m.from_user.id,
+                "item_name": item_name,
+                "price": price,
+                "msg_id": sent_msg.message_id
+            }
             return
+        except Exception as e:
+            logging.error(f"[SHOP ERROR] {e}")
+            return await m.answer("К сожалению, сейчас купля-продажа недоступна")
 
-    # Обычные РП-команды
+    # --- МАГАЗИН (ПОКУПКА) ---
+    if t in ["покупаю", "купить"] and m.reply_to_message:
+        try:
+            shop_data = active_shop_items.get(m.chat.id)
+            if shop_data and shop_data["msg_id"] == m.reply_to_message.message_id:
+                buyer_nick = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+
+                await m.answer(f"✨{buyer_nick} приобретает {shop_data['item_name']} за {shop_data['price']}")
+                del active_shop_items[m.chat.id]
+                return
+        except Exception as e:
+            logging.error(f"[BUY ERROR] {e}")
+            return await m.answer("К сожалению, сейчас купля-продажа недоступна")
+
+    # --- ОБЫЧНЫЕ РП-КОМАНДЫ ---
     cmd = db_query("SELECT response_text FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, t), fetchone=True)
     if cmd:
         await try_delete(m)
@@ -742,4 +745,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())ы
