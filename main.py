@@ -481,28 +481,6 @@ async def msg_activity_handler(m: types.Message):
     await try_delete(m)
     await m.answer(txt, parse_mode="Markdown")
 
-@dp.message(Command("вещи", prefix="+"))  # или через regex / filter
-async def give_item_admin(message: Message):
-    # 1. Проверяем, что пишет админ (уровень 3 или 4)
-    if not is_admin(message.from_user.id):
-        return await message.reply("🌫️Эта команда доступна только приспешникам!")
-
-    # 2. Проверяем, что команда отправлена ответом на сообщение
-    if not message.reply_to_message:
-        return await message.reply("👁️ Ответьте на сообщение того, кому хотите выдать вещь!")
-
-    # 3. Достаем название предмета из текста
-    item_name = message.text.replace("+вещи", "").strip()
-    if not item_name:
-        return await message.reply("👁️ Укажите название предмета. Пример: `+вещи Меч`")
-
-    target_user_id = message.reply_to_message.from_user.id
-
-    # 4. Начисляем предмет в БД напрямую пользователю
-    add_item_to_inventory(user_id=target_user_id, item_name=item_name)
-    receiver_name = get_display_name(m.chat.id, tid, tname)
-    await message.reply(f"🎁{receiver_name} получил(а) {item_name}!")
-    
 # --- ПЕРЕДАЧА КАССЕТ ---
 @dp.message(F.text.lower().startswith("кассеты"))
 async def transfer_tapes_handler(m: types.Message):
