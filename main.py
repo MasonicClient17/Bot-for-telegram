@@ -773,7 +773,7 @@ async def create_marriage_handler(m: types.Message):
 
     # Если делал обычный участник с предметом — списываем его
     if u_lvl < 1 and inv_item:
-        db_query("UPDATE inventory SET count = count - 1 WHERE chat_id=? AND user_id=? AND  LOWER(item_name)='бессрочное бракосочетание'", (m.chat.id, m.from_user.id), commit=True)
+        db_query("UPDATE inventory SET count = count - 1 WHERE chat_id=? AND user_id=? AND LOWER(item_name)='бессрочное бракосочетание'", (m.chat.id, m.from_user.id), commit=True)
 
     today_str = datetime.now().strftime("%Y-%m-%d")
     db_query("INSERT INTO marriages VALUES (?,?,?,?)", (m.chat.id, u1_id, u2_id, today_str), commit=True)
