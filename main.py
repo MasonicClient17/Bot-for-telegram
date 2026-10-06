@@ -238,6 +238,24 @@ async def resolve_target(m: types.Message):
 
     return None, None, None
 
+def get_user_stats(cid: int, uid: int):
+    """Единый метод расчета верной статистики сообщений для любых команд"""
+    now = datetime.now()
+    today_str = now.strftime("%Y-%m-%d")
+    iso_year, iso_week, _ = now.isocalendar()
+    week_str = f"{iso_year}-{iso_week}"
+    
+    data = db_query("SELECT day_count, week_count, last_msg_date, week_number, joined_at, tapes, msg_count FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
+    if not data:
+        return 0, 0, today_str, 0, 0
+    
+    day_c, week_c, last_date, last_week, joined, tapes, tot_c = data
+    real_day = day_c if last_date == today_str else 0
+    real_week = week_c if last_week == week_str else 0
+    real_joined = joined or today_str
+    
+    return real_day, real_week, real_joined, (tapes or 0), (tot_c or 0)
+
 async def track_user_and_daily(m: types.Message):
     cid, uid = m.chat.id, m.from_user.id
     fname, username = m.from_user.first_name, m.from_user.username
@@ -284,23 +302,6 @@ async def track_user_and_daily(m: types.Message):
         uname = get_display_name(cid, uid, fname)
         daily_msg = await m.answer(f"📼 **{uname}**, держи ежедневную копеечку: **+{daily_reward}** кассет!", parse_mode="Markdown")
         asyncio.create_task(delete_after_delay(daily_msg, 60))
-
-def get_user_stats(cid: int, uid: int):
-    now = datetime.now()
-    today_str = now.strftime("%Y-%m-%d")
-    iso_year, iso_week, _ = now.isocalendar()
-    week_str = f"{iso_year}-{iso_week}"
-    
-    data = db_query("SELECT day_count, week_count, last_msg_date, week_number, joined_at, tapes FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
-    if not data:
-        return 0, 0, today_str, 0
-    
-    day_c, week_c, last_date, last_week, joined, tapes = data
-    real_day = day_c if last_date == today_str else 0
-    real_week = week_c if last_week == week_str else 0
-    real_joined = joined or today_str
-    
-    return real_day, real_week, real_joined, (tapes or 0)
 
 # ==================== ПРИВЕТСТВИЕ ====================
 
@@ -353,27 +354,32 @@ async def user_profile_handler(m: types.Message):
         tid = m.from_user.id
         tname = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
     
-    day_cnt, week_cnt, joined_date, tapes = get_user_stats(m.chat.id, tid)
+    day_cnt, week_cnt, joined_date, tapes, _ = get_user_stats(m.chat.id, tid)
     same_count = (day_cnt == week_cnt)
     
+    # Получаем юзернейм для вывода
+    cm_data = db_query("SELECT username FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, tid), fetchone=True)
+    un_prefix = f"(@{cm_data[0]}) " if cm_data and cm_data[0] else ""
+    full_user_str = f"{un_prefix}{tname}"
+    
     if week_cnt <= 10:
-        msg = f"🌸 Похоже {tname} немногословна~ всего **{week_cnt}** сообщений в этой неделе."
+        msg = f"🌸 Похоже {full_user_str} немногословна~ всего **{week_cnt}** сообщений в этой неделе."
         if not same_count:
             msg += f" А сегодня **{day_cnt}**."
     elif 11 <= week_cnt <= 30:
-        msg = f"🌸 У этой мультяшки всего **{week_cnt}** сообщений за неделю~."
+        msg = f"🌸 У этой мультяшки {full_user_str} всего **{week_cnt}** сообщений за неделю~."
         if not same_count:
             msg += f" За сегодня **{day_cnt}**."
     elif 31 <= week_cnt <= 70:
-        msg = f"🌸 Ох~ у этой мультяшки **{week_cnt}** сообщений за эту неделю."
+        msg = f"🌸 Ох~ у этой мультяшки {full_user_str} **{week_cnt}** сообщений за эту неделю."
         if not same_count:
             msg += f" А за сегодня **{day_cnt}**~"
     elif 71 <= week_cnt <= 100:
-        msg = f"🌸 Ого, у этой мультяшки **{week_cnt}** сообщений за эту неделю!~\n{tname}, вы молодец!"
+        msg = f"🌸 Ого, у этой мультяшки {full_user_str} **{week_cnt}** сообщений за эту неделю!~\n{tname}, вы молодец!"
         if not same_count:
             msg += f"\nА за сегодня **{day_cnt}** сообщений."
     else:
-        msg = f"🌸 Вот это да~ **{week_cnt}** сообщений в неделю 👏🏻👏🏻\n{tname}, вы молодец!✨"
+        msg = f"🌸 Вот это да~ **{week_cnt}** сообщений в неделю 👏🏻👏🏻\n{full_user_str}, вы молодец!✨"
         if not same_count:
             msg += f"\nСегодня **{day_cnt}** сообщений."
             
@@ -503,15 +509,46 @@ async def call_all_handler(m: types.Message):
 @dp.message(F.text.lower().startswith(("актив", "стата", "статистика")))
 async def stats_handler(m: types.Message):
     if not await check_access(m, "стата"): return
-    args = re.sub(r"^(актив|стата|статистика)", "", m.text, flags=re.I).strip()
+    
+    raw_text = m.text.lower().strip()
+    is_daily = "день" in raw_text
+    
+    # Удаляем ключевые слова и флаг "день"
+    args = re.sub(r"^(актив|стата|статистика)", "", raw_text).strip()
+    args = re.sub(r"\bдень\b", "", args).strip()
     page = max(1, int(args) if args.isdigit() else 1)
-    tot = (db_query("SELECT COUNT(*) FROM users WHERE chat_id=?", (m.chat.id,), fetchone=True) or [0])[0]
+    
+    # Получаем свежие валидированные данные всех юзеров чата
+    all_users = db_query("SELECT u.user_id, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=?", (m.chat.id,), fetchall=True)
+    
+    user_stats_list = []
+    for uid, fn in all_users:
+        day_cnt, week_cnt, _, _, _ = get_user_stats(m.chat.id, uid)
+        cnt = day_cnt if is_daily else week_cnt
+        if cnt > 0:
+            disp_name = get_display_name(m.chat.id, uid, fn or f"ID:{uid}")
+            user_stats_list.append((disp_name, cnt))
+            
+    # Сортируем по убыванию сообщений
+    user_stats_list.sort(key=lambda x: x[1], reverse=True)
+    
+    tot = len(user_stats_list)
     pages = math.ceil(tot / 10) or 1
-    if page > pages:
+    if page > pages and tot > 0:
         return await m.answer(f"🫗 Страницы {page} не существует. Всего: {pages}")
-    rows = db_query("SELECT u.user_id, u.msg_count, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=? ORDER BY u.msg_count DESC LIMIT 10 OFFSET ?", (m.chat.id, (page-1)*10), fetchall=True)
-    txt = f"📊 **Активность участников (Стр. {page}/{pages}):**\n\n" + "\n".join([f"{i}. {get_display_name(m.chat.id, u, fn or 'ID:'+str(u))} — {cnt} сообщ." for i, (u, cnt, fn) in enumerate(rows, (page-1)*10+1)])
-    await try_delete(m); await m.answer(txt, parse_mode="Markdown")
+        
+    start_idx = (page - 1) * 10
+    page_data = user_stats_list[start_idx:start_idx + 10]
+    
+    title_mode = "дневной" if is_daily else "недельный"
+    txt = f"📊 **Активность участников ({title_mode}) [Стр. {page}/{pages}]:**\n\n"
+    if not page_data:
+        txt += "🫙 В этом периоде пока нет активности."
+    else:
+        txt += "\n".join([f"{i}. {name} — {cnt} сообщ." for i, (name, cnt) in enumerate(page_data, start_idx + 1)])
+        
+    await try_delete(m)
+    await m.answer(txt, parse_mode="Markdown")
 
 @dp.message(F.text.lower().startswith(("напоить сиропом", "клиновый сироп", "дать воды")))
 async def mute_handler(m: types.Message):
@@ -665,7 +702,7 @@ async def view_rules_handler(m: types.Message):
         txt = f"📜 **Раздел {arg}. {stitle}**\n\n" + "\n\n".join([f"**{arg}.{i} {t}**\n{c}" for i, t, c in items if i != 0])
         return await m.answer(txt, parse_mode="Markdown")
     all_rules = db_query("SELECT section, item, title, content FROM rules WHERE chat_id=? ORDER BY section ASC, item ASC", (m.chat.id,), fetchall=True)
-    if not all_rules: return await m.answer("👁️️ Устав ещё пуст!")
+    if not all_rules: return await m.answer("👁 Устав ещё пуст!")
     txt, cur_sec = "📜 **Устав / Правила чата:**\n\n", None
     for sec, itm, title, content in all_rules:
         if sec != cur_sec:
@@ -822,8 +859,8 @@ async def process_msg(m: types.Message):
         users = db_query("SELECT user_id, first_name FROM chat_members WHERE chat_id=?", (m.chat.id,), fetchall=True)
         rand_user = get_display_name(m.chat.id, *random.choice(users)) if users else "Кто-то"
 
-        s_day, s_week, _, _ = get_user_stats(m.chat.id, m.from_user.id)
-        r_day, r_week, _, _ = get_user_stats(m.chat.id, tid) if tid else (0, 0, "", 0)
+        s_day, s_week, _, _, _ = get_user_stats(m.chat.id, m.from_user.id)
+        r_day, r_week, _, _, _ = get_user_stats(m.chat.id, tid) if tid else (0, 0, "", 0, 0)
 
         res = cmd[0]
         replacements = {
