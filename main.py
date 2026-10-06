@@ -569,6 +569,45 @@ async def admin_tapes_handler(m: types.Message):
 
 # ==================== МАГАЗИН И ПРЕДМЕТЫ DANDY ====================
 
+@dp.message(F.text.startswith("+вещи"))
+async def give_item_admin(m: types.Message):
+    if not await check_access(m, "+вещь"):
+        return
+
+    text = m.text[6:].strip()
+    tid, tname, tstr = await resolve_target(m)
+
+    if not tid:
+        return await m.answer("🫗 Укажите пользователя (ответом или через @/ID)!", parse_mode="Markdown")
+
+    clean_item = text
+    if tstr and (tstr.startswith("@") or tstr.isdigit()):
+        clean_item = re.sub(re.escape(tstr), "", clean_item, flags=re.I).strip()
+
+    count = 1
+    words = clean_item.split()
+    if words and words[-1].isdigit():
+        count = int(words[-1])
+        item_name = " ".join(words[:-1]).strip()
+    else:
+        item_name = clean_item.strip()
+
+    if not item_name:
+        return await m.answer("🫗 Укажите название вещи! Пример: `+вещи [название] [кол-во] [юзер]`", parse_mode="Markdown")
+
+    db_query(
+        "INSERT INTO inventory (chat_id, user_id, item_name, count) VALUES (?,?,?,?) ON CONFLICT(chat_id, user_id, item_name) DO UPDATE SET count=count+excluded.count",
+        (m.chat.id, tid, item_name, count),
+        commit=True
+    )
+
+    admin_name = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+    target_name = get_display_name(m.chat.id, tid, tname)
+
+    schedule_sync()
+    await try_delete(m)
+    await m.answer(f"🌸 **{admin_name}** выгрузил(а) из инвентаря **{item_name}** ({count} шт.) и передал(а) **{target_name}**.")
+
 @dp.message(F.text.lower().startswith(("+вещь", "создать предмет")))
 async def master_add_item_handler(m: types.Message):
     if not await check_access(m, "+вещь"): return
@@ -1080,8 +1119,7 @@ async def rem_tag_handler(m: types.Message):
     schedule_sync(); await try_delete(m)
     disp_name = get_display_name(m.chat.id, tid, tname)
     await m.answer(f"🏷 Тэг у {disp_name} был удалён.")
-
-# --- РП КОМАНДЫ ---
+        # --- РП КОМАНДЫ ---
 
 @dp.message(F.text.startswith(("+команда", "+комманда")))
 async def add_cmd(m: types.Message):
