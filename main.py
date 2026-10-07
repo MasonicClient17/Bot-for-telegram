@@ -567,9 +567,9 @@ async def admin_tapes_handler(m: types.Message):
     schedule_sync(); await try_delete(m)
 
     if is_self:
-        await m.answer(f"🌸 {sender_name} материализовал(а) кассеты из ниоткуда")
+        await m.answer(f"🌸 {sender_name} материализовал(а) {new_val}📼 из ниоткуда")
     else:
-        await m.answer(f"🌸 {sender_name} материализовал(а) кассеты из ниоткуда и отдал(а) их {target_name}.")
+        await m.answer(f"🌸 {sender_name} материализовал(а) {new_val}📼 из ниоткуда и отдал(а) их {target_name}.")
 
 # ==================== МАГАЗИН И ПРЕДМЕТЫ DANDY ====================
 
