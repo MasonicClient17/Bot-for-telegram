@@ -559,7 +559,11 @@ async def admin_tapes_handler(m: types.Message):
     else:
         new_val = amount
 
-    db_query("INSERT INTO users (chat_id, user_id, tapes) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET tapes=?", (m.chat.id, target_id, new_val), commit=True)
+    db_query(
+    "INSERT INTO users (chat_id, user_id, tapes) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET tapes=excluded.tapes", 
+    (m.chat.id, target_id, new_val), 
+    commit=True
+    )
     schedule_sync(); await try_delete(m)
 
     if is_self:
