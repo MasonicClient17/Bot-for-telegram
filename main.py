@@ -39,7 +39,7 @@ FORBIDDEN_PATTERNS = [
 ]
 
 def db_query(sql, params=(), fetchone=False, fetchall=False, commit=False):
-    with sqlite3.connect(DB_FILE) as conn:
+    with sqlite3.connect(DB_FILE, timeout=10.0) as conn:
         c = conn.cursor()
         c.execute(sql, params)
         if commit: conn.commit()
@@ -70,7 +70,6 @@ def init_db():
         if col not in cols:
             db_query(f"ALTER TABLE users ADD COLUMN {col} {col_type};", commit=True)
 
-    # Инициализация первоначальных вещей 4 уровня
     master_defaults = [("Освобождение от нормы", 1000), ("Бессрочное бракосочетание", 100)]
     for iname, iprice in master_defaults:
         db_query("INSERT OR IGNORE INTO master_items (chat_id, item_name, base_price) VALUES (0, ?, ?)", (iname, iprice), commit=True)
@@ -314,8 +313,9 @@ async def track_user_and_daily(m: types.Message):
             WHERE chat_id=? AND user_id=?
         """, (new_tot, new_day_c, new_week_c, today_str, week_str, new_joined, cid, uid), commit=True)
 
+    # ВЫДАЧА ЕЖЕДНЕВНЫХ КАССЕТ (30-50 кассет)
     if is_new_day:
-        daily_reward = random.randint(10, 50)
+        daily_reward = random.randint(30, 50)
         db_query("UPDATE users SET tapes = COALESCE(tapes, 0) + ? WHERE chat_id=? AND user_id=?", (daily_reward, cid, uid), commit=True)
         uname = get_display_name(cid, uid, fname)
         daily_msg = await m.answer(f"📼 **{uname}**, держи ежедневную копеечку: **+{daily_reward}** кассет!", parse_mode="Markdown")
@@ -415,7 +415,7 @@ async def tapes_stats_handler(m: types.Message):
     args = re.sub(r"^(стата|статистика)", "", raw_text).strip()
     page = max(1, int(args) if args.isdigit() else 1)
     
-    all_users = db_query("SELECT u.user_id, u.tapes, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=?", (m.chat.id,), fetchall=True)
+    all_users = db_query("SELECT u.user_id, u.tapes, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=?", (m.chat.id,), fetchall=True) or []
     
     tapes_list = []
     for uid, tapes, fn in all_users:
@@ -452,7 +452,7 @@ async def msg_activity_handler(m: types.Message):
     args = re.sub(r"\bдень\b", "", args).strip()
     page = max(1, int(args) if args.isdigit() else 1)
     
-    all_users = db_query("SELECT u.user_id, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=?", (m.chat.id,), fetchall=True)
+    all_users = db_query("SELECT u.user_id, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=?", (m.chat.id,), fetchall=True) or []
     
     user_stats_list = []
     for uid, fn in all_users:
@@ -688,15 +688,12 @@ async def buy_item_handler(m: types.Message):
     if user_tapes < price:
         return await m.answer(f"📼 Недостаточно кассет! Требуется: **{price}** 📼, у вас: **{user_tapes}** 📼.")
 
-    # Поиск Dandy
     dandy_res = db_query("SELECT user_id FROM user_tags WHERE chat_id=? AND LOWER(tag_name)='dandy'", (m.chat.id,), fetchone=True)
     
-    # Списание и перевод средств
     db_query("UPDATE users SET tapes = tapes - ? WHERE chat_id=? AND user_id=?", (price, m.chat.id, m.from_user.id), commit=True)
     if dandy_res:
         db_query("INSERT INTO users (chat_id, user_id, tapes) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET tapes=COALESCE(tapes,0)+excluded.tapes", (m.chat.id, dandy_res[0], price), commit=True)
 
-    # Начисление вещи покупателю
     db_query("INSERT INTO inventory (chat_id, user_id, item_name, count) VALUES (?,?,?,1) ON CONFLICT(chat_id, user_id, item_name) DO UPDATE SET count=count+1", (m.chat.id, m.from_user.id, real_item_name), commit=True)
     
     buyer_nick = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
@@ -757,9 +754,8 @@ async def use_item_handler(m: types.Message):
     uname = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
 
     if real_iname.lower() == "освобождение от нормы":
-        # Списываем вещь
         db_query("UPDATE inventory SET count = count - 1 WHERE chat_id=? AND user_id=? AND item_name=?", (m.chat.id, m.from_user.id, real_iname), commit=True)
-        creator_id = 7350331661  # ID создателя
+        creator_id = 7350331661
         try:
             await bot.send_message(creator_id, f"📜 **Уведомление об Освобождении от нормы:**\nПользователь **{uname}** (ID: {m.from_user.id}) применил вещь 'Освобождение от нормы' в чате {m.chat.title or m.chat.id}!")
             await m.answer(f"✨ **{uname}** использовал(а) **Освобождение от нормы**! Создатель группы получил уведомление в ЛС.")
@@ -777,12 +773,10 @@ async def create_marriage_handler(m: types.Message):
     u_lvl = await get_user_lvl(m.chat.id, m.from_user.id)
     inv_item = db_query("SELECT count FROM inventory WHERE chat_id=? AND user_id=? AND LOWER(item_name)='бессрочное бракосочетание' AND count > 0", (m.chat.id, m.from_user.id), fetchone=True)
     
-    # Права: Уровень 1+ ИЛИ наличие предмета "Бессрочное бракосочетание"
     if u_lvl < 1 and not inv_item:
         return await m.answer("🌫 У вас нет прав для создания браков или предмета 'Бессрочное бракосочетание'!")
 
     u1_id, u2_id = None, None
-    text_args = m.text[5:].strip()
 
     if m.reply_to_message and m.reply_to_message.from_user:
         u1_id = m.from_user.id
@@ -810,7 +804,6 @@ async def create_marriage_handler(m: types.Message):
     if existing:
         return await m.answer("🌸 Один из участников уже состоит в браке!")
 
-    # Если делал обычный участник с предметом — списываем его
     if u_lvl < 1 and inv_item:
         db_query("UPDATE inventory SET count = count - 1 WHERE chat_id=? AND user_id=? AND LOWER(item_name)='бессрочное бракосочетание'", (m.chat.id, m.from_user.id), commit=True)
 
@@ -847,7 +840,7 @@ async def remove_marriage_handler(m: types.Message):
     if not u1_id or not u2_id:
         return await m.answer("🫗 Использование: `-брак @user1 @user2` или `-брак` ответом!", parse_mode="Markdown")
 
-    deleted = db_query("DELETE FROM marriages WHERE chat_id=? AND ((user1_id=? AND user2_id=?) OR (user1_id=? AND user2_id=?))", (m.chat.id, u1_id, u2_id, u2_id, u1_id), commit=True)
+    db_query("DELETE FROM marriages WHERE chat_id=? AND ((user1_id=? AND user2_id=?) OR (user1_id=? AND user2_id=?))", (m.chat.id, u1_id, u2_id, u2_id, u1_id), commit=True)
     schedule_sync(); await try_delete(m)
     await m.answer("💔 Брак был успешно расторгнут.")
 
@@ -1119,7 +1112,8 @@ async def rem_tag_handler(m: types.Message):
     schedule_sync(); await try_delete(m)
     disp_name = get_display_name(m.chat.id, tid, tname)
     await m.answer(f"🏷 Тэг у {disp_name} был удалён.")
-        # --- РП КОМАНДЫ ---
+
+# --- РП КОМАНДЫ ---
 
 @dp.message(F.text.startswith(("+команда", "+комманда")))
 async def add_cmd(m: types.Message):
@@ -1153,10 +1147,13 @@ async def list_cmds(m: types.Message):
 @dp.message(F.text)
 async def process_msg(m: types.Message):
     if m.chat.type == "private" or not m.from_user: return
-    await track_user_and_daily(m)
+    try:
+        await track_user_and_daily(m)
+    except Exception as e:
+        logging.error(f"[TRACK_ERROR] {e}")
+
     t = m.text.lower().strip()
 
-    # --- ОБЫЧНЫЕ РП-КОМАНДЫ ---
     cmd = db_query("SELECT response_text FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (m.chat.id, t), fetchone=True)
     if cmd:
         await try_delete(m)
