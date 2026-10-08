@@ -363,6 +363,9 @@ async def show_welcome(m: types.Message):
 
 # ==================== ПРОФИЛЬ И ВАЛЮТА ====================
 
+from aiogram import html  # Убедитесь, что импортировали html из aiogram
+
+
 @dp.message(F.text.lower().startswith(("кто я", "профиль")))
 async def user_profile_handler(m: types.Message):
     if not await check_access(m, "кто я"): 
@@ -373,63 +376,7 @@ async def user_profile_handler(m: types.Message):
         tid = m.from_user.id
         tname = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
     
-    day_cnt, week_cnt, joined_date, tapes, _ = get_user_stats(m.chat.id, tid)
-    same_count = (day_cnt == week_cnt)
-    
-    cm_data = db_query("SELECT username FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, tid), fetchone=True)
-    un_prefix = f"(@{cm_data[0]}) " if cm_data and cm_data[0] else ""
-    full_user_str = f"{un_prefix}{tname}"
-    
-    if week_cnt <= 10:
-        msg = f"🌸 Похоже {full_user_str} немногословна~ всего **{week_cnt}** сообщений на этой неделе."
-        if not same_count:
-            msg += f" А сегодня **{day_cnt}**."
-    elif 11 <= week_cnt <= 30:
-        msg = f"🌸 У этой мультяшки {full_user_str} всего **{week_cnt}** сообщений за неделю~."
-        if not same_count:
-            msg += f" За сегодня **{day_cnt}**."
-    elif 31 <= week_cnt <= 70:
-        msg = f"🌸 Ох~ у этой мультяшки {full_user_str} **{week_cnt}** сообщений за эту неделю."
-        if not same_count:
-            msg += f" А за сегодня **{day_cnt}**~"
-    elif 71 <= week_cnt <= 100:
-        msg = f"🌸 Ого, у этой мультяшки {full_user_str} **{week_cnt}** сообщений за эту неделю!~\n{tname}, вы молодец!"
-        if not same_count:
-            msg += f"\nА за сегодня **{day_cnt}** сообщений."
-    else:
-        msg = f"🌸 Вот это да~ **{week_cnt}** сообщений в неделю 👏🏻👏🏻\n{full_user_str}, вы молодец!✨"
-        if not same_count:
-            msg += f"\nСегодня **{day_cnt}** сообщений."
-            
-    msg += f"\n\n📼 Баланс кассет: **{tapes}**📼"
-    msg += f"\n✨ присоединилась к саду: **{joined_date}**"
-    
-    await try_delete(m)
-    await m.answer(msg, parse_mode="Markdown")
-    
-# --- СТАТИСТИКА КАССЕТ С ПОСТРАНИЧНЫМ ВЫВОДОМ ---
-@dp.message(F.text.lower().startswith(("стата", "статистика")))
-async def tapes_stats_handler(m: types.Message):
-    if not await check_access(m, "стата"): return
-    
-    raw_text = m.text.lower().strip()
-    args = re.sub(r"^(стата|статистика)", "", raw_text).strip()
-    page = max(1, int(args) if args.isdigit() else 1)
-    
-    all_users = db_query("SELECT u.user_id, u.tapes, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=?", (m.chat.id,), fetchall=True) or []
-    
-    tapes_list = []
-    for uid, tapes, fn in all_users:
-        disp_name = get_display_name(m.chat.id, uid, fn or f"ID:{uid}")
-        tapes_list.append((disp_name, tapes or 0))
-            
-    tapes_list.sort(key=lambda x: x[1], reverse=True)
-    
-    tot = len(tapes_list)
-    pages = math.ceil(tot / 10) or 1
-    if page > pages and tot > 0:
-        return await m.answer(f"🫗 Страницы {page} не существует. Всего страниц: {pages}")
-        
+    # Экранируем имя пользователя, чтобы спецсимволы не ломали версткуы
     start_idx = (page - 1) * 10
     page_data = tapes_list[start_idx:start_idx + 10]
     
