@@ -363,9 +363,10 @@ async def show_welcome(m: types.Message):
 
 # ==================== ПРОФИЛЬ И ВАЛЮТА ====================
 
-@dp.message(F.text.lower().in_(["кто я", "профиль"]))
+@dp.message(F.text.lower().startswith(("кто я", "профиль")))
 async def user_profile_handler(m: types.Message):
-    if not await check_access(m, "кто я"): return
+    if not await check_access(m, "кто я"): 
+        return
     
     tid, tname, _ = await resolve_target(m)
     if not tid:
@@ -380,7 +381,7 @@ async def user_profile_handler(m: types.Message):
     full_user_str = f"{un_prefix}{tname}"
     
     if week_cnt <= 10:
-        msg = f"🌸 Похоже {full_user_str} немногословна~ всего **{week_cnt}** сообщений в этой неделе."
+        msg = f"🌸 Похоже {full_user_str} немногословна~ всего **{week_cnt}** сообщений на этой неделе."
         if not same_count:
             msg += f" А сегодня **{day_cnt}**."
     elif 11 <= week_cnt <= 30:
@@ -405,7 +406,7 @@ async def user_profile_handler(m: types.Message):
     
     await try_delete(m)
     await m.answer(msg, parse_mode="Markdown")
-
+    
 # --- СТАТИСТИКА КАССЕТ С ПОСТРАНИЧНЫМ ВЫВОДОМ ---
 @dp.message(F.text.lower().startswith(("стата", "статистика")))
 async def tapes_stats_handler(m: types.Message):
