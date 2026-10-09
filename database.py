@@ -31,6 +31,9 @@ async def init_db():
         "CREATE TABLE IF NOT EXISTS merchant_catalog (chat_id INT, item_name TEXT PRIMARY KEY, price INT, is_master_item INT DEFAULT 0);",
         "CREATE TABLE IF NOT EXISTS master_items (chat_id INT, item_name TEXT PRIMARY KEY, base_price INT);",
         "CREATE TABLE IF NOT EXISTS marriages (chat_id INT, user1_id INT, user2_id INT, date TEXT, PRIMARY KEY (chat_id, user1_id, user2_id));"
+        "CREATE TABLE IF NOT EXISTS quizzes (quiz_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INT, message_id INT, creator_id INT, question TEXT, correct_answer TEXT, is_active INT DEFAULT 1, created_at TEXT);",
+        "CREATE TABLE IF NOT EXISTS quiz_answers (quiz_id INT, user_id INT, is_correct INT, PRIMARY KEY (quiz_id, user_id));"
+        
     ]
     for q in queries:
         await db_query(q, commit=True)
