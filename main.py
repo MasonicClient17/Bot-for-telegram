@@ -1,6 +1,6 @@
 import asyncio, json, logging, math, os, re, random, sqlite3, itertools
 from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, types, html
 from aiogram.enums import ParseMode
 from aiogram.types import ChatPermissions, BufferedInputFile
 
@@ -363,9 +363,6 @@ async def show_welcome(m: types.Message):
 
 # ==================== ПРОФИЛЬ И ВАЛЮТА ====================
 
-from aiogram import html  # Убедитесь, что импортировали html из aiogram
-
-
 @dp.message(F.text.lower().startswith(("кто я", "профиль")))
 async def user_profile_handler(m: types.Message):
     if not await check_access(m, "кто я"): 
@@ -376,7 +373,68 @@ async def user_profile_handler(m: types.Message):
         tid = m.from_user.id
         tname = get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
     
-    # Экранируем имя пользователя, чтобы спецсимволы не ломали версткуы
+    safe_tname = html.quote(tname)
+    day_cnt, week_cnt, joined_date, tapes, _ = get_user_stats(m.chat.id, tid)
+    same_count = (day_cnt == week_cnt)
+    
+    cm_data = db_query("SELECT username FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, tid), fetchone=True)
+    if cm_data and cm_data[0]:
+        un_prefix = f"(@{html.quote(cm_data[0])}) "
+    else:
+        un_prefix = ""
+        
+    full_user_str = f"{un_prefix}{safe_tname}"
+    
+    if week_cnt <= 10:
+        msg = f"🌸 Похоже {full_user_str} немногословна~ всего <b>{week_cnt}</b> сообщений на этой неделе."
+        if not same_count:
+            msg += f" А сегодня <b>{day_cnt}</b>."
+    elif 11 <= week_cnt <= 30:
+        msg = f"🌸 У этой мультяшки {full_user_str} всего <b>{week_cnt}</b> сообщений за неделю~."
+        if not same_count:
+            msg += f" За сегодня <b>{day_cnt}</b>."
+    elif 31 <= week_cnt <= 70:
+        msg = f"🌸 Ох~ у этой мультяшки {full_user_str} <b>{week_cnt}</b> сообщений за эту неделю."
+        if not same_count:
+            msg += f" А за сегодня <b>{day_cnt}</b>~"
+    elif 71 <= week_cnt <= 100:
+        msg = f"🌸 Ого, у этой мультяшки {full_user_str} <b>{week_cnt}</b> сообщений за эту неделю!~\n{safe_tname}, вы молодец!"
+        if not same_count:
+            msg += f"\nА за сегодня <b>{day_cnt}</b> сообщений."
+    else:
+        msg = f"🌸 Вот это да~ <b>{week_cnt}</b> сообщений в неделю 👏🏻👏🏻\n{full_user_str}, вы молодец!✨"
+        if not same_count:
+            msg += f"\nСегодня <b>{day_cnt}</b> сообщений."
+            
+    msg += f"\n\n📼 Баланс кассет: <b>{tapes}</b>📼"
+    msg += f"\n✨ присоединилась к саду: <b>{html.quote(str(joined_date))}</b>"
+    
+    await try_delete(m)
+    await m.answer(msg, parse_mode="HTML")
+
+# --- СТАТИСТИКА КАССЕТ С ПОСТРАНИЧНЫМ ВЫВОДОМ ---
+@dp.message(F.text.lower().startswith(("стата", "статистика")))
+async def tapes_stats_handler(m: types.Message):
+    if not await check_access(m, "стата"): return
+    
+    raw_text = m.text.lower().strip()
+    args = re.sub(r"^(стата|статистика)", "", raw_text).strip()
+    page = max(1, int(args) if args.isdigit() else 1)
+    
+    all_users = db_query("SELECT u.user_id, u.tapes, cm.first_name FROM users u LEFT JOIN chat_members cm ON u.user_id=cm.user_id AND u.chat_id=cm.chat_id WHERE u.chat_id=?", (m.chat.id,), fetchall=True) or []
+    
+    tapes_list = []
+    for uid, tapes, fn in all_users:
+        disp_name = get_display_name(m.chat.id, uid, fn or f"ID:{uid}")
+        tapes_list.append((disp_name, tapes or 0))
+            
+    tapes_list.sort(key=lambda x: x[1], reverse=True)
+    
+    tot = len(tapes_list)
+    pages = math.ceil(tot / 10) or 1
+    if page > pages and tot > 0:
+        return await m.answer(f"🫗 Страницы {page} не существует. Всего страниц: {pages}")
+        
     start_idx = (page - 1) * 10
     page_data = tapes_list[start_idx:start_idx + 10]
     
@@ -508,9 +566,9 @@ async def admin_tapes_handler(m: types.Message):
         new_val = amount
 
     db_query(
-    "INSERT INTO users (chat_id, user_id, tapes) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET tapes=excluded.tapes", 
-    (m.chat.id, target_id, new_val), 
-    commit=True
+        "INSERT INTO users (chat_id, user_id, tapes) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET tapes=excluded.tapes", 
+        (m.chat.id, target_id, new_val), 
+        commit=True
     )
     schedule_sync(); await try_delete(m)
 
@@ -952,7 +1010,6 @@ async def unban_handler(m: types.Message):
     except Exception as e: await m.answer(f"👁 Ошибка: {e}")
 
 # --- УСТАВ ---
-
 @dp.message(F.text.startswith(("+устав", "+правила")))
 async def edit_rules_handler(m: types.Message):
     if not await check_access(m, "+устав"): return
