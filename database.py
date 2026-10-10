@@ -42,14 +42,13 @@ async def init_db():
     for q in queries:
         await db_query(q, commit=True)
     
-    # Миграция колонок users
+    # Авто-миграция колонок users на случай старой локальной БД
     cols_data = await db_query("PRAGMA table_info(users)", fetchall=True)
     cols = [r[1] for r in cols_data] if cols_data else []
     for col, col_type in [("status", "TEXT"), ("rep", "INT DEFAULT 0")]:
         if col not in cols:
             await db_query(f"ALTER TABLE users ADD COLUMN {col} {col_type}", commit=True)
 
-# Дефолтные фразы и команды (новое уютное оформление)
 DEFAULT_PHRASES = {
     "profile_title": "🌿 <b>Уютный профиль участника {user}</b>",
     "welcome_text": "🌿 Приветствие успешно обновлено!",
@@ -116,8 +115,21 @@ async def restore_from_telegram():
         content = downloaded.getvalue().decode('utf-8') if isinstance(downloaded, io.BytesIO) else downloaded.read().decode('utf-8')
         data = json.loads(content)
 
+        # Безопасное восстановление: совместимо как со старым бэкапом (12 полей), так и с новым (14 полей)
         for u in data.get("users", []):
-            await db_query("INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name, warns, msg_count, day_count, week_count, last_msg_date, week_number, joined_at, tapes, status, rep) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", tuple(u[:14]), commit=True)
+            if len(u) == 12:
+                u_tuple = tuple(u) + (None, 0)
+            elif len(u) == 13:
+                u_tuple = tuple(u) + (0,)
+            else:
+                u_tuple = tuple(u[:14])
+
+            await db_query(
+                "INSERT OR REPLACE INTO users (chat_id, user_id, role_level, rp_name, warns, msg_count, day_count, week_count, last_msg_date, week_number, joined_at, tapes, status, rep) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                u_tuple,
+                commit=True
+            )
+
         for inv in data.get("inventory", []):
             await db_query("INSERT OR REPLACE INTO inventory VALUES (?,?,?,?)", tuple(inv), commit=True)
         for mc in data.get("merchant_catalog", []):
@@ -126,7 +138,8 @@ async def restore_from_telegram():
             await db_query("INSERT OR REPLACE INTO dynamic_phrases VALUES (?,?,?)", tuple(dp), commit=True)
         for dc in data.get("dynamic_commands", []):
             await db_query("INSERT OR REPLACE INTO dynamic_commands VALUES (?,?,?)", tuple(dc), commit=True)
-        logging.info("[RESTORE] Восстановлено успешно!")
+            
+        logging.info("[RESTORE] Данные из бэкапа успешно восстановлены!")
     except Exception as e:
         logging.error(f"[RESTORE] Ошибка восстановления: {e}")
         
