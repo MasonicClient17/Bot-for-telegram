@@ -1,7 +1,5 @@
-import asyncio
 import random
 import re
-from datetime import datetime
 from aiogram import Router, F, types, html
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.exceptions import TelegramAPIError
@@ -24,17 +22,15 @@ async def create_quiz_handler(m: types.Message):
     if user_tag.lower() != "vee":
         return await m.answer("🌫️ Задавать викторины может только пользователь с тэгом <b>Vee</b>!")
 
-    # Регулярное выражение ожидает точку с запятой (;) в качестве разделителя вариантов
     match = re.match(r"^викторина\s+(.+?)\s+ответы:\s*\[(.+)\]$", m.text.strip(), re.I | re.S)
     if not match:
         return await m.answer(
             "🫗 <b>Формат команды:</b>\n"
             "<code>викторина [Вопрос]? Ответы: [Правильный ответ; Вариант 2; Вариант 3]</code>\n\n"
-            "<i>Обратите внимание: варианты разделяются точкой с запятой (;), а не запятой!</i>"
+            "<i>Варианты разделяются точкой с запятой (;). Первый ответ — правильный!</i>"
         )
 
     question = match.group(1).strip()
-    # Разделяем варианты ответа по точке с запятой (;)
     raw_answers = [a.strip() for a in match.group(2).split(";") if a.strip()]
 
     if len(raw_answers) < 2:
@@ -44,12 +40,10 @@ async def create_quiz_handler(m: types.Message):
     shuffled_answers = raw_answers.copy()
     random.shuffle(shuffled_answers)
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
-    # Сохраняем creator_id пользователя с тегом Vee
+    # Сохраняем в БД (is_active = 1)
     await db_query(
-        "INSERT INTO quizzes (chat_id, message_id, creator_id, question, correct_answer, is_active, created_at) VALUES (?, 0, ?, ?, ?, 1, ?)",
-        (m.chat.id, m.from_user.id, question, correct_answer, now_str),
+        "INSERT INTO quizzes (chat_id, message_id, creator_id, question, correct_answer, is_active, created_at) VALUES (?, 0, ?, ?, ?, 1, datetime('now'))",
+        (m.chat.id, m.from_user.id, question, correct_answer),
         commit=True
     )
 
@@ -59,7 +53,7 @@ async def create_quiz_handler(m: types.Message):
     await try_delete(m)
 
     vee_name = await get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
-    msg_text = f"🌸 <b>Викторина от {html.quote(vee_name)}!</b>\n\n<b>{html.quote(question)}</b>"
+    msg_text = f"🌸 <b>Викторина от {html.quote(vee_name)}!</b>\n\n<b>{html.quote(question)}</b>\n\n<i>Для завершения автор может ответить на это сообщение словом «завершить».</i>"
 
     kb_builder = InlineKeyboardBuilder()
     for ans in shuffled_answers:
@@ -81,8 +75,57 @@ async def create_quiz_handler(m: types.Message):
     await db_query("UPDATE quizzes SET message_id=? WHERE quiz_id=?", (sent_msg.message_id, quiz_id), commit=True)
     schedule_sync()
 
-    # Запускаем таймер на 15 минут (900 секунд)
-    asyncio.create_task(finish_quiz_after_delay(quiz_id, m.chat.id, sent_msg.message_id, 900))
+
+# Обработка ручного завершения викторины создателем в чате
+@router.message(F.text.lower() == "завершить")
+async def manual_finish_quiz_handler(m: types.Message):
+    if not m.reply_to_message:
+        return
+
+    # Ищем викторину по message_id закрепленного/отвеченного сообщения
+    quiz = await db_query(
+        "SELECT quiz_id, chat_id, creator_id, is_active FROM quizzes WHERE chat_id=? AND message_id=?",
+        (m.chat.id, m.reply_to_message.message_id),
+        fetchone=True
+    )
+
+    if not quiz:
+        return
+
+    quiz_id, chat_id, creator_id, is_active = quiz
+    if is_active == 0:
+        return await m.answer("🫗 Эта викторина уже завершена!")
+
+    # Проверяем, что завершает именно автор (Vee)
+    if m.from_user.id != creator_id:
+        return await m.answer("🌫️ Завершить викторину может только её создатель!")
+
+    await finalize_quiz(quiz_id, chat_id, m.reply_to_message.message_id, creator_id)
+    await try_delete(m)
+
+
+# Завершение всех викторин через личные сообщения бота
+@router.message(F.text.lower() == "завершить все")
+async def finish_all_quizzes_private(m: types.Message):
+    if m.chat.type != "private":
+        return await m.answer("🫗 Эту команду нужно писать в личные сообщения боту!")
+
+    # Находим все активные викторины, созданные этим пользователем
+    active_quizzes = await db_query(
+        "SELECT quiz_id, chat_id, message_id, creator_id FROM quizzes WHERE creator_id=? AND is_active=1",
+        (m.from_user.id,),
+        fetchall=True
+    )
+
+    if not active_quizzes:
+        return await m.answer("🫙 У вас нет активных викторин.")
+
+    count = 0
+    for quiz_id, chat_id, message_id, creator_id in active_quizzes:
+        await finalize_quiz(quiz_id, chat_id, message_id, creator_id)
+        count += 1
+
+    await m.answer(f"✨ Успешно завершено ваших викторин: <b>{count}</b>.")
 
 
 @router.callback_query(F.data.startswith("qans:"))
@@ -96,11 +139,11 @@ async def process_quiz_answer(call: types.CallbackQuery):
     uid = call.from_user.id
     cid = call.message.chat.id
 
-    quiz = await db_query("SELECT is_active, creator_id, question FROM quizzes WHERE quiz_id=?", (quiz_id,), fetchone=True)
+    quiz = await db_query("SELECT is_active, creator_id, message_id, question FROM quizzes WHERE quiz_id=?", (quiz_id,), fetchone=True)
     if not quiz or quiz[0] == 0:
         return await call.answer("🫗 Эта викторина уже завершена!", show_alert=True)
 
-    creator_id, question = quiz[1], quiz[2]
+    creator_id, message_id, question = quiz[1], quiz[2], quiz[3]
 
     if uid == creator_id:
         return await call.answer("🌸 Вы создатель этой викторины, нельзя отвечать на неё!", show_alert=True)
@@ -144,20 +187,23 @@ async def process_quiz_answer(call: types.CallbackQuery):
         except TelegramAPIError:
             pass
 
+    # Проверяем, ответили ли ВСЕ участники чата (кроме создателя)
+    members = await db_query("SELECT user_id FROM chat_members WHERE chat_id=? AND user_id!=?", (cid, creator_id), fetchall=True) or []
+    answers = await db_query("SELECT user_id FROM quiz_answers WHERE quiz_id=?", (quiz_id,), fetchall=True) or []
+
+    if members and len(answers) >= len(members):
+        # Если ответили все участники — автоматически завершаем викторину
+        await finalize_quiz(quiz_id, cid, message_id, creator_id)
+
     schedule_sync()
 
 
-async def finish_quiz_after_delay(quiz_id: int, chat_id: int, message_id: int, delay: int = 900):
-    await asyncio.sleep(delay)
-
-    quiz = await db_query("SELECT is_active, creator_id, question FROM quizzes WHERE quiz_id=?", (quiz_id,), fetchone=True)
-    if not quiz or quiz[0] == 0:
-        return
-
+async def finalize_quiz(quiz_id: int, chat_id: int, message_id: int, creator_id: int):
+    # Помечаем викторину неактивной
     await db_query("UPDATE quizzes SET is_active=0 WHERE quiz_id=?", (quiz_id,), commit=True)
 
-    creator_id = quiz[1]
-    question_text = quiz[2]
+    quiz = await db_query("SELECT question FROM quizzes WHERE quiz_id=?", (quiz_id,), fetchone=True)
+    question_text = quiz[0] if quiz else ""
     vee_name = await get_display_name(chat_id, creator_id, "Vee")
 
     answers = await db_query("SELECT user_id, is_correct FROM quiz_answers WHERE quiz_id=?", (quiz_id,), fetchall=True) or []
@@ -182,6 +228,7 @@ async def finish_quiz_after_delay(quiz_id: int, chat_id: int, message_id: int, d
         f"<b>Ответившие неправильно:</b>\n{incorr_text}"
     )
 
+    # Изменяем сообщение в чате на результаты
     try:
         await bot.edit_message_text(
             text=final_msg,
@@ -192,11 +239,13 @@ async def finish_quiz_after_delay(quiz_id: int, chat_id: int, message_id: int, d
     except TelegramAPIError:
         pass
 
+    # Открепляем сообщение викторины
     try:
         await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
     except TelegramAPIError:
         pass
 
+    # Отправляем результаты создателю викторины (Vee) в ЛС
     try:
         await bot.send_message(
             creator_id,
