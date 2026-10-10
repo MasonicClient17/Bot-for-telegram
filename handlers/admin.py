@@ -124,8 +124,23 @@ async def process_norm_action(call: types.CallbackQuery):
         try:
             await bot.ban_chat_member(chat_id, target_uid)
             target_name = await get_display_name(chat_id, target_uid, "Участник")
-            await bot.send_message(chat_id, f"🌚 <b>{html.quote(target_name)}</b> отправляется в банку!")
+            await bot.send_messa
+            ge(chat_id, f"🌚 <b>{html.quote(target_name)}</b> отправляется в банку!")
             await call.message.edit_text("🔨 Забанен.")
         except TelegramAPIError as e:
             await call.answer(f"Ошибка: {e}", show_alert=True)
-            
+
+from database import backup_to_telegram
+
+@router.message(F.text.lower() == "/save")
+async def save_all_data_handler(m: types.Message):
+    if m.chat.type == "private" or not await check_access(m, "норма"):
+        return
+    
+    try:
+        # Вызываем полный бэкап всех таблиц, пользователей, кастомных команд и настроек
+        await backup_to_telegram()
+        await m.answer("💾 <b>Успешно!</b> Все данные, настройки, кастомные команды и статистика сохранены в резервное хранилище.")
+    except Exception as e:
+        await m.answer(f"⚠️ Ошибка при сохранении: {e}")
+        
