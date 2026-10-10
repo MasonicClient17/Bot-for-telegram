@@ -253,3 +253,24 @@ async def dandy_sell_item_handler(m: types.Message):
     await try_delete(m)
     await m.answer(f"🛍 Торговец Dandy выставил на продажу: <b>{html.quote(item_name)}</b> за <b>{sell_price}</b> 📼")
     
+@router.message(F.text.lower().startswith("покупаю"))
+async def buy_item_alias_handler(m: types.Message):
+    # Перенаправляем логику на стандартный buy_item_handler или обрабатываем аналогично
+    item_name = m.text[7:].strip()
+    if not item_name and m.reply_to_message:
+        # Пытаемся вытащить название из текста ответа бота
+        rep_text = m.reply_to_message.text or m.reply_to_message.caption or ""
+        # Пример текста лавки: • Название — цена 📼
+        match_item = re.search(r"•\s+<b>(.+?)<\/b>", rep_text)
+        if match_item:
+            item_name = match_item.group(1)
+
+    if not item_name:
+        return await m.answer("🫗 Использование: <code>покупаю [название вещи]</code> или ответом на товар в магазине!")
+
+    # Эмулируем вызов покупки через подмену текста или вызов функции
+    m.text = f"купить {item_name}"
+    # Вызываем существующий buy_item_handler
+    from handlers.shop import buy_item_handler
+    await buy_item_handler(m)
+    
