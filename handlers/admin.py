@@ -1,149 +1,131 @@
-import re
+import logging
 from datetime import datetime
 from aiogram import Router, F, types, html
-from aiogram.types import ChatPermissions
-from config import LEVEL_NAMES
-from database import db_query
-from utils import check_access, resolve_target, get_display_name, parse_mod_args, try_delete, schedule_sync
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramAPIError
+from config import bot
+from database import db_query, get_text, get_cmd_name
+from utils import check_access, get_display_name, try_delete, schedule_sync
 
 router = Router()
 
-@router.message(F.text.lower().startswith(("+тессак", "-тессак", "тессак")))
-async def admin_tapes_handler(m: types.Message):
-    if not await check_access(m, "+тессак"): return
-    text = m.text.strip()
-    if text.lower().startswith("+тессак"): mode, rest = "add", text[7:].strip()
-    elif text.lower().startswith("-тессак"): mode, rest = "sub", text[7:].strip()
-    else: mode, rest = "set", text[6:].strip()
-
-    match = re.match(r"^(\d+)(.*)$", rest)
-    if not match: return await m.answer("🫗 Формат: <code>тессак [число] [пользователь]</code>")
-
-    amount = int(match.group(1))
-    tid, tname, _ = await resolve_target(m)
-    sender_name = await get_display_name(m.chat.id, m.from_user.id, m.from_user.first_name)
-
-    is_self = False
-    if not tid or tid == m.from_user.id:
-        target_id, target_name, is_self = m.from_user.id, sender_name, True
-    else:
-        target_id, target_name = tid, await get_display_name(m.chat.id, tid, tname)
-
-    current_tapes_res = await db_query("SELECT tapes FROM users WHERE chat_id=? AND user_id=?", (m.chat.id, target_id), fetchone=True)
-    current_tapes = current_tapes_res[0] if current_tapes_res else 0
-
-    new_val = current_tapes + amount if mode == "add" else (max(0, current_tapes - amount) if mode == "sub" else amount)
-    await db_query("INSERT INTO users (chat_id, user_id, tapes) VALUES (?,?,?) ON CONFLICT(chat_id, user_id) DO UPDATE SET tapes=excluded.tapes", (m.chat.id, target_id, new_val), commit=True)
-    
-    schedule_sync(); await try_delete(m)
-    safe_s, safe_t = html.quote(sender_name), html.quote(target_name)
-    await m.answer(f"🌸 <b>{safe_s}</b> материализовал(а) {new_val}📼 из ниоткуда" + ("" if is_self else f" и отдал(а) их <b>{safe_t}</b>."))
-
-@router.message(F.text.lower().startswith(("напоить сиропом", "клиновый сироп", "дать воды")))
-async def mute_handler(m: types.Message):
-    if not await check_access(m, "напоить сиропом"): return
-    tid, tname, tstr = await resolve_target(m)
-    if not tid: return await m.answer("🌸 Ответьте на сообщение пользователя!")
+# Установка нормы
+@router.message(F.text.lower().startswith("норма"))
+async def set_chat_norm(m: types.Message):
+    if m.chat.type == "private" or not await check_access(m, "норма"):
+        return
+    parts = m.text.strip().split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        return await m.answer("☕ Формат: <code>норма [число]</code>")
+    val = int(parts[1])
+    await db_query("INSERT OR REPLACE INTO chat_norms (chat_id, min_messages) VALUES (?, ?)", (m.chat.id, val), commit=True)
+    schedule_sync()
     await try_delete(m)
-    safe_tname = html.quote(tname)
-    if m.text.lower().startswith("дать воды"):
-        try:
-            await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True))
-            return await m.answer(f"🥛 {safe_tname} получил(а) воды!")
-        except Exception as e: return await m.answer(f"👁 Ошибка: {e}")
-    mins, r_str = parse_mod_args(m.text, tstr, ["напоить сиропом", "клиновый сироп"])
-    try:
-        await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=False), until_date=int(datetime.now().timestamp()) + mins*60)
-        await m.answer(f"🫗 {safe_tname} отправлен молчать на {mins} мин.{r_str}")
-    except Exception as e: await m.answer(f"👁 Ошибка: {e}")
+    text = await get_text(m.chat.id, "norm_set", val=val)
+    await m.answer(text)
 
-@router.message(F.text.lower().startswith("дать плод всей боли"))
-async def mute_24h_handler(m: types.Message):
-    if not await check_access(m, "дать плод всей боли"): return
-    tid, tname, tstr = await resolve_target(m)
-    if not tid: return await m.answer("🌸 Ответьте на сообщение пользователя!")
-    reason = parse_mod_args(m.text, tstr, ["дать плод всей боли"])[1]
-    try:
-        await m.chat.restrict(tid, permissions=ChatPermissions(can_send_messages=False), until_date=int(datetime.now().timestamp()) + 86400)
-        await try_delete(m); await m.answer(f"🍇 {html.quote(tname)} вкусил(а) плод всей боли...{reason}")
-    except Exception as e: await m.answer(f"👁 Ошибка: {e}")
+# Изменение текстов бота через чат: +текст [ключ] [значение]
+@router.message(F.text.lower().startswith("+текст"))
+async def set_dynamic_phrase(m: types.Message):
+    if m.chat.type == "private" or not await check_access(m, "+текст"):
+        return
+    parts = m.text.strip().split(maxsplit=2)
+    if len(parts) < 3:
+        return await m.answer("☕ Формат: <code>+текст [ключ] [новый текст]</code>\n\nКлючи: <code>profile_title</code>, <code>welcome_text</code>, <code>norm_set</code>, <code>cookie_get</code>, <code>cookie_cooldown</code>")
+    key, val = parts[1], parts[2]
+    await db_query("INSERT OR REPLACE INTO dynamic_phrases VALUES (?, ?, ?)", (m.chat.id, key, val), commit=True)
+    await m.answer(f"🌿 Текст для ключа <code>{key}</code> успешно обновлен!")
 
-@router.message(F.text.lower().startswith(("варн", "отругать")))
-async def give_warn_handler(m: types.Message):
-    if not await check_access(m, "варн"): return
-    tid, tname, tstr = await resolve_target(m)
-    if not tid: return await m.answer("🌸 Ответьте на сообщение пользователя!")
-    reason = parse_mod_args(m.text, tstr, ["варн", "отругать"])[1]
+# Изменение названий админ-команд через чат: +команда [действие] [новое_имя]
+@router.message(F.text.lower().startswith("+команда"))
+async def set_dynamic_command(m: types.Message):
+    if m.chat.type == "private" or not await check_access(m, "+команда"):
+        return
+    parts = m.text.strip().split(maxsplit=2)
+    if len(parts) < 3:
+        return await m.answer("☕ Формат: <code>+команда [действие] [новое имя]</code>\n\nДействия: <code>ban</code>, <code>mute</code>, <code>unmute</code>, <code>warn</code>")
+    action, name = parts[1].lower(), parts[2].lower()
+    await db_query("INSERT OR REPLACE INTO dynamic_commands VALUES (?, ?, ?)", (m.chat.id, action, name), commit=True)
+    await m.answer(f"🌿 Команда для действия <code>{action}</code> теперь называется: <b>{name}</b>")
 
-    await db_query("INSERT INTO users (chat_id, user_id, warns) VALUES (?,?,1) ON CONFLICT(chat_id, user_id) DO UPDATE SET warns=warns+1", (m.chat.id, tid), commit=True)
-    warns_res = await db_query("SELECT warns FROM users WHERE chat_id=? AND user_id=?", (m.chat.id, tid), fetchone=True)
-    warns = warns_res[0] if warns_res else 0
+# Универсальный обработчик админ-команд (удалить, -звук и т.д. по ответу или упоминанию)
+@router.message()
+async def dynamic_admin_handler(m: types.Message):
+    if m.chat.type == "private" or not m.text:
+        return
+    text_lower = m.text.strip().lower()
     
-    schedule_sync(); await try_delete(m)
-    safe_tname = html.quote(tname)
-    if warns >= 3:
-        await db_query("UPDATE users SET warns=0 WHERE chat_id=? AND user_id=?", (m.chat.id, tid), commit=True)
-        try:
-            await m.chat.ban(tid)
-            await m.answer(f"🫙 {safe_tname} получил(а) 3/3 предупреждений и запечатан(а) в банку с джемом!{reason}")
-        except Exception as e: await m.answer(f"👁 Не удалось забанить: {e}")
-    else:
-        await m.answer(f"🌫 {safe_tname} получил(а) предупреждение [{warns}/3].{reason}")
-
-@router.message(F.text.lower().startswith(("-варн", "снять варн")))
-async def remove_warn_handler(m: types.Message):
-    if not await check_access(m, "-варн"): return
-    tid, tname, _ = await resolve_target(m)
-    if not tid: return await m.answer("🌸 Ответьте на сообщение пользователя!")
-    warns_res = await db_query("SELECT warns FROM users WHERE chat_id=? AND user_id=?", (m.chat.id, tid), fetchone=True)
-    warns = warns_res[0] if warns_res else 0
-    if warns <= 0: return await m.answer(f"🌸 У {html.quote(tname)} нет предупреждений.")
-
-    await db_query("UPDATE users SET warns=? WHERE chat_id=? AND user_id=?", (warns - 1, m.chat.id, tid), commit=True)
-    schedule_sync(); await try_delete(m)
-    await m.answer(f"🌸 У {html.quote(tname)} снято предупреждение. Теперь: [{warns - 1}/3].")
-
-@router.message(F.text.lower().startswith(("-варны", "снять все варны")))
-async def clear_warns_handler(m: types.Message):
-    if not await check_access(m, "-варны"): return
-    tid, tname, _ = await resolve_target(m)
-    if not tid: return await m.answer("🌸 Ответьте на сообщение пользователя!")
-    await db_query("UPDATE users SET warns=0 WHERE chat_id=? AND user_id=?", (m.chat.id, tid), commit=True)
-    schedule_sync(); await try_delete(m)
-    await m.answer(f"🌸 Все предупреждения с {html.quote(tname)} сняты! [0/3].")
-
-@router.message(F.text.lower().startswith(("в банку", "банка с джемом")))
-async def ban_handler(m: types.Message):
-    if not await check_access(m, "в банку"): return
-    tid, tname, tstr = await resolve_target(m)
-    if not tid: return await m.answer("🫗 Ответьте на сообщение пользователя!")
-    reason = parse_mod_args(m.text, tstr, ["в банку", "банка с джемом"])[1]
-    try:
-        await m.chat.ban(tid); await try_delete(m)
-        await m.answer(f"🫙 {html.quote(tname)} запечатан(а) в банку с джемом.{reason}")
-    except Exception as e: await m.answer(f"👁 Ошибка: {e}")
-
-@router.message(F.text.lower().startswith("вытащить из банки"))
-async def unban_handler(m: types.Message):
-    if not await check_access(m, "в банку"): return
-    tid, tname, _ = await resolve_target(m)
-    if not tid:
-        return await m.answer("🌸 Укажите пользователя")
-    try:
-        await m.chat.unban(tid, only_if_banned=True)
-        await try_delete(m)
-        await m.answer(f"🌸 {html.quote(tname)} достали из банки!")
-    except Exception as e:
-        await m.answer(f"👁 Ошибка: {e}")
+    ban_cmd = await get_cmd_name(m.chat.id, "ban")
+    mute_cmd = await get_cmd_name(m.chat.id, "mute")
+    
+    if text_lower.startswith(ban_cmd):
+        if not await check_access(m, "ban"):
+            return
+        target_id = None
+        if m.reply_to_message:
+            target_id = m.reply_to_message.from_user.id
+        elif len(m.text.split()) > 1:
+            # Попытка извлечь упоминание или ID
+            args = m.text.split()[1]
+            if args.isdigit():
+                target_id = int(args)
         
-@router.message(F.text.lower().startswith("сменить"))
-async def change_cmd_level_handler(m: types.Message):
-    if not await check_access(m, "сменить"): return
-    mat = re.search(r"^сменить\s*\((.+?)\)\s*(\d+)$", m.text.strip(), re.I)
-    if not mat: return await m.answer("🫗 Формат: <code>сменить (команда) уровень</code>")
-    cmd, lvl = mat.group(1).strip().lower(), int(mat.group(2))
-    if not (0 <= lvl <= 4): return await m.answer("🫗 Уровень должен быть от 0 до 4!")
-    await db_query("INSERT INTO cmd_levels VALUES (?,?,?) ON CONFLICT(chat_id, cmd_name) DO UPDATE SET min_lvl=excluded.min_lvl", (m.chat.id, cmd, lvl), commit=True)
-    schedule_sync(); await try_delete(m)
-    await m.answer(f"🌸 Уровень допуска для ({html.quote(cmd)}) изменён на {lvl} ({LEVEL_NAMES[lvl]}).")
-  
+        if target_id:
+            try:
+                await bot.ban_chat_member(m.chat.id, target_id)
+                name = await get_display_name(m.chat.id, target_id, "Участник")
+                await m.answer(f"🌚 <b>{html.quote(name)}</b> отправляется в банку!")
+                await try_delete(m)
+            except TelegramAPIError as e:
+                await m.answer(f"⚠️ Ошибка бана: {e}")
+
+# Функция проверки нормок (вызывается из хэндлера сообщений)
+async def check_and_enforce_norm(chat_id: int, user_id: int, user_first_name: str):
+    current_week = datetime.now().strftime('%Y-W%V')
+    user_data = await db_query("SELECT week_number, week_count FROM users WHERE chat_id=? AND user_id=?", (chat_id, user_id), fetchone=True)
+    if not user_data:
+        return
+    db_week_num, week_count = user_data[0], user_data[1]
+
+    if db_week_num and db_week_num != current_week:
+        norm_res = await db_query("SELECT min_messages FROM chat_norms WHERE chat_id=?", (chat_id,), fetchone=True)
+        if norm_res and norm_res[0] > 0:
+            min_norm = norm_res[0]
+            if (week_count or 0) < min_norm:
+                creator_res = await db_query("SELECT user_id FROM users WHERE chat_id=? ORDER BY role_level DESC LIMIT 1", (chat_id,), fetchone=True)
+                if creator_res:
+                    creator_id = creator_res[0]
+                    target_name = await get_display_name(chat_id, user_id, user_first_name)
+                    alert_text = (
+                        f"Эта мультяшка не набрала норму, что делаем?\n\n"
+                        f"👤 Пользователь: <b>{html.quote(target_name)}</b>\n"
+                        f"📊 Сообщений: <b>{week_count or 0}</b> из <b>{min_norm}</b>."
+                    )
+                    builder = InlineKeyboardBuilder()
+                    builder.button(text="Игнорировать", callback_data=f"norm_action:ignore:{chat_id}:{user_id}")
+                    builder.button(text="Бан", callback_data=f"norm_action:ban:{chat_id}:{user_id}")
+                    builder.adjust(2)
+                    try:
+                        await bot.send_message(creator_id, alert_text, reply_markup=builder.as_markup())
+                    except TelegramAPIError:
+                        pass
+        await db_query("UPDATE users SET week_count = 1, week_number = ? WHERE chat_id=? AND user_id=?", (current_week, chat_id, user_id), commit=True)
+    else:
+        await db_query("UPDATE users SET msg_count = msg_count + 1, week_count = COALESCE(week_count, 0) + 1, week_number = COALESCE(week_number, ?) WHERE chat_id=? AND user_id=?", (current_week, chat_id, user_id), commit=True)
+
+@router.callback_query(F.data.startswith("norm_action:"))
+async def process_norm_action(call: types.CallbackQuery):
+    _, action, chat_id_str, target_uid_str = call.data.split(":")
+    chat_id, target_uid = int(chat_id_str), int(target_uid_str)
+    if action == "ignore":
+        await call.message.edit_text("✨ Нарушитель проигнорирован.")
+        return await call.answer()
+    elif action == "ban":
+        try:
+            await bot.ban_chat_member(chat_id, target_uid)
+            target_name = await get_display_name(chat_id, target_uid, "Участник")
+            await bot.send_message(chat_id, f"🌚 <b>{html.quote(target_name)}</b> отправляется в банку!")
+            await call.message.edit_text("🔨 Забанен.")
+        except TelegramAPIError as e:
+            await call.answer(f"Ошибка: {e}", show_alert=True)
+            
