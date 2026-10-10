@@ -7,12 +7,12 @@ from utils import get_display_name, schedule_sync
 router = Router()
 
 COOKIES_TEXTS = [
-    "Сегодня тебя ждёт неожиданная чашка вкусного чая и приятный сюрприз.",
-    "Твоя улыбка сегодня способна согреть даже самый хмурый чат.",
-    "Отличный день, чтобы сделать то, что давно откладывал!",
-    "Звёзды говорят, что сегодня удача полностью на твоей стороне.",
-    "Помни: отдыхать тоже важно, не забывай баловать себя.",
-    "Рядом с тобой всегда есть те, кому ты дорог."
+    "📃Сегодня тебя ждёт неожиданная чашка вкусного чая и приятный сюрприз.",
+    "📷Твоя улыбка сегодня способна согреть даже самый хмурый чат.",
+    "🎇Отличный день, чтобы сделать то, что давно откладывал!",
+    "🌄Звёзды говорят, что сегодня удача полностью на твоей стороне.",
+    "🌃Помни: отдыхать тоже важно, не забывай баловать себя.",
+    "🌌Рядом с тобой всегда есть те, кому ты дорог."
 ]
 
 @router.message(F.text.lower().in_(["печенька", "гадание", "предсказание"]))
@@ -42,7 +42,7 @@ async def who_is_here(m: types.Message):
         return
     active = await db_query("SELECT user_id, rp_name FROM users WHERE chat_id=? ORDER BY msg_count DESC LIMIT 10", (m.chat.id,), fetchall=True)
     if not active:
-        return await m.answer("🌿 Пока тут тихо.")
+        return await m.answer(" Пока тут тихо.")
     
     lines = []
     for uid, rp in active:
@@ -50,7 +50,7 @@ async def who_is_here(m: types.Message):
         name = rp or member.user.first_name
         lines.append(f"• <b>{html.quote(name)}</b>")
     
-    await m.answer("🌿 <b>Самые активные мультяшки чата:</b>\n\n" + "\n".join(lines))
+    await m.answer("🪼 <b>Самые активные мультяшки чата:</b>\n\n" + "\n".join(lines))
 
 # Система репутации (спасибо, красавчик, молодец)
 @router.message(F.text.lower().in_(["спасибо", "спасибки", "красавчик", "красавица", "молодец", "+"]))
