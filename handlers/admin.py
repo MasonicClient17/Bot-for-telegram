@@ -1,4 +1,4 @@
-import re
+,import re
 from datetime import datetime
 from aiogram import Router, F, types, html
 from aiogram.types import ChatPermissions
@@ -127,12 +127,15 @@ async def ban_handler(m: types.Message):
 async def unban_handler(m: types.Message):
     if not await check_access(m, "в банку"): return
     tid, tname, _ = await resolve_target(m)
-    if not tid: return await m.answer("🌸 Ответьте на сообщение пользователя!")
+    if not tid:
+        return await m.answer("🌸 Укажите пользователя")
     try:
-        await m.chat.unban(tid, only_if_banned=True); await try_delete(m)
+        await m.chat.unban(tid, only_if_banned=True)
+        await try_delete(m)
         await m.answer(f"🌸 {html.quote(tname)} достали из банки!")
-    except Exception as e: await m.answer(f"👁 Ошибка: {e}")
-
+    except Exception as e:
+        await m.answer(f"👁 Ошибка: {e}")
+        
 @router.message(F.text.lower().startswith("сменить"))
 async def change_cmd_level_handler(m: types.Message):
     if not await check_access(m, "сменить"): return
