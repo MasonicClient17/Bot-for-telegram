@@ -6,11 +6,13 @@ from datetime import datetime
 from aiogram.types import BufferedInputFile
 from config import DB_FILE, STORAGE_CHAT_ID, bot
 
-async def db_query(sql, params=(), fetchone=False, fetchall=False, commit=False):
+async def db_query(sql, params=(), fetchone=False, fetchall=False, commit=False, return_lastrowid=False):
     async with aiosqlite.connect(DB_FILE, timeout=10.0) as conn:
         async with conn.execute(sql, params) as cursor:
             if commit:
                 await conn.commit()
+            if return_lastrowid:
+                return cursor.lastrowid
             if fetchone:
                 return await cursor.fetchone()
             if fetchall:
@@ -34,7 +36,6 @@ async def init_db():
         "CREATE TABLE IF NOT EXISTS quizzes (quiz_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INT, message_id INT, creator_id INT, question TEXT, correct_answer TEXT, is_active INT DEFAULT 1, created_at TEXT)",
         "CREATE TABLE IF NOT EXISTS quiz_answers (quiz_id INT, user_id INT, is_correct INT, PRIMARY KEY (quiz_id, user_id))",
         "CREATE TABLE IF NOT EXISTS deliveries (delivery_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INT, dyle_user_id INT, item_name TEXT, count INT, cost INT, created_at TEXT)"
-        
     ]
     for q in queries:
         await db_query(q, commit=True)
@@ -66,7 +67,8 @@ async def backup_to_telegram():
         "master_items": await db_query("SELECT chat_id, item_name, base_price FROM master_items", fetchall=True),
         "marriages": await db_query("SELECT chat_id, user1_id, user2_id, date FROM marriages", fetchall=True),
         "quizzes": await db_query("SELECT quiz_id, chat_id, message_id, creator_id, question, correct_answer, is_active, created_at FROM quizzes", fetchall=True),
-        "quiz_answers": await db_query("SELECT quiz_id, user_id, is_correct FROM quiz_answers", fetchall=True)
+        "quiz_answers": await db_query("SELECT quiz_id, user_id, is_correct FROM quiz_answers", fetchall=True),
+        "deliveries": await db_query("SELECT delivery_id, chat_id, dyle_user_id, item_name, count, cost, created_at FROM deliveries", fetchall=True)
     }
     file = BufferedInputFile(json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'), filename="backup.json")
     try:
@@ -122,6 +124,7 @@ async def restore_from_telegram():
         for mar in data.get("marriages", []): await db_query("INSERT OR REPLACE INTO marriages VALUES (?,?,?,?)", tuple(mar), commit=True)
         for qz in data.get("quizzes", []): await db_query("INSERT OR REPLACE INTO quizzes VALUES (?,?,?,?,?,?,?,?)", tuple(qz), commit=True)
         for qa in data.get("quiz_answers", []): await db_query("INSERT OR REPLACE INTO quiz_answers VALUES (?,?,?)", tuple(qa), commit=True)
+        for dl in data.get("deliveries", []): await db_query("INSERT OR REPLACE INTO deliveries VALUES (?,?,?,?,?,?,?)", tuple(dl), commit=True)
         logging.info("[RESTORE] Восстановлено успешно!")
     except Exception as e:
         logging.error(f"[RESTORE] Ошибка восстановления: {e}")
