@@ -1,8 +1,9 @@
 from aiogram import Router
-from . import welcome, profile, admin, shop, marriages, rules, tags_nicks, quizzes, custom_rp
+from . import welcome, profile, admin, shop, marriages, rules, tags_nicks, quizzes, custom_rp, norms
 
 router = Router()
 
+router.include_router(norms.router)
 router.include_router(welcome.router)
 router.include_router(profile.router)
 router.include_router(admin.router)
