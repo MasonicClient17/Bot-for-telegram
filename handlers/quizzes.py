@@ -18,19 +18,14 @@ router = Router()
 
 @router.message(F.text.lower().startswith("викторина"))
 async def create_quiz_handler(m: types.Message):
-    logging.info(f"[QUIZ_LOG] Пользователь {m.from_user.id} вызвал команду создания викторины в чате {m.chat.id}. Текст: {m.text}")
+    logging.info(f"[QUIZ_LOG] Пользователь {m.from_user.id} вызвал создание викторины в чате {m.chat.id}")
     
-    # Проверка тэга Vee
     user_tag = await get_user_tag(m.chat.id, m.from_user.id)
-    logging.info(f"[QUIZ_LOG] Тэг пользователя {m.from_user.id}: '{user_tag}'")
-    
     if user_tag.lower() != "vee":
-        logging.warning(f"[QUIZ_LOG] Отказано в создании викторины: у пользователя нет тэга Vee.")
         return await m.answer("🌫️ Задавать викторины может только пользователь с тэгом <b>Vee</b>!")
 
     match = re.match(r"^викторина\s+(.+?)\s+ответы:\s*\[(.+)\]$", m.text.strip(), re.I | re.S)
     if not match:
-        logging.warning(f"[QUIZ_LOG] Ошибка парсинга аргументов викторины.")
         return await m.answer(
             "🫗 <b>Формат команды:</b>\n"
             "<code>викторина [Вопрос]? Ответы: [Правильный ответ; Вариант 2; Вариант 3]</code>\n\n"
@@ -39,7 +34,6 @@ async def create_quiz_handler(m: types.Message):
 
     question = match.group(1).strip()
     raw_answers = [a.strip() for a in match.group(2).split(";") if a.strip()]
-    logging.info(f"[QUIZ_LOG] Распознан вопрос: '{question}', вариантов ответа: {len(raw_answers)}")
 
     if len(raw_answers) < 2:
         return await m.answer("🫗 Викторина должна содержать минимум 2 варианта ответа, разделенных точкой с запятой (;).")
@@ -48,19 +42,18 @@ async def create_quiz_handler(m: types.Message):
     shuffled_answers = raw_answers.copy()
     random.shuffle(shuffled_answers)
 
-    # Сохраняем в БД
+    # Безопасно получаем корректный quiz_id через return_lastrowid=True
     try:
-        await db_query(
+        quiz_id = await db_query(
             "INSERT INTO quizzes (chat_id, message_id, creator_id, question, correct_answer, is_active, created_at) VALUES (?, 0, ?, ?, ?, 1, datetime('now'))",
             (m.chat.id, m.from_user.id, question, correct_answer),
-            commit=True
+            commit=True,
+            return_lastrowid=True
         )
-        quiz_res = await db_query("SELECT last_insert_rowid()", fetchone=True)
-        quiz_id = quiz_res[0]
-        logging.info(f"[QUIZ_LOG] Викторина успешно записана в БД с ID: {quiz_id}")
+        logging.info(f"[QUIZ_LOG] Викторина успешно создана. Получен ID: {quiz_id}")
     except Exception as e:
-        logging.error(f"[QUIZ_LOG ERROR] Ошибка записи викторины в БД: {e}")
-        return await m.answer("👁️ Произошла ошибка при сохранении викторины в базу данных.")
+        logging.error(f"[QUIZ_LOG ERROR] Ошибка создания викторины в БД: {e}")
+        return await m.answer("👁️ Ошибка при сохранении викторины в базу данных.")
 
     await try_delete(m)
 
@@ -78,15 +71,12 @@ async def create_quiz_handler(m: types.Message):
 
     try:
         sent_msg = await m.answer(msg_text, reply_markup=kb_builder.as_markup())
-        logging.info(f"[QUIZ_LOG] Сообщение викторины отправлено в чат. Message ID: {sent_msg.message_id}")
     except Exception as e:
         logging.error(f"[QUIZ_LOG ERROR] Не удалось отправить сообщение викторины: {e}")
         return
 
-    # Закрепляем сообщение
     try:
         await bot.pin_chat_message(chat_id=m.chat.id, message_id=sent_msg.message_id, disable_notification=True)
-        logging.info(f"[QUIZ_LOG] Сообщение викторины закреплено.")
     except TelegramAPIError as e:
         logging.warning(f"[QUIZ_LOG] Не удалось закрепить сообщение: {e}")
 
@@ -96,7 +86,6 @@ async def create_quiz_handler(m: types.Message):
 
 @router.message(F.text.lower() == "завершить")
 async def manual_finish_quiz_handler(m: types.Message):
-    logging.info(f"[QUIZ_LOG] Пользователь {m.from_user.id} запросил завершение викторины через реплай в чате {m.chat.id}")
     if not m.reply_to_message:
         return
 
@@ -107,17 +96,13 @@ async def manual_finish_quiz_handler(m: types.Message):
     )
 
     if not quiz:
-        logging.info(f"[QUIZ_LOG] Викторина по message_id {m.reply_to_message.message_id} не найдена в БД.")
         return
 
     quiz_id, chat_id, creator_id, is_active = quiz
-    logging.info(f"[QUIZ_LOG] Найдена викторина ID {quiz_id}. Статус is_active: {is_active}, создатель: {creator_id}")
-
     if is_active == 0:
         return await m.answer("🍋")
 
     if m.from_user.id != creator_id:
-        logging.warning(f"[QUIZ_LOG] Пользователь {m.from_user.id} попытался завершить чужую викторину (автор: {creator_id})")
         return await m.answer("🌫️ Завершить викторину может только её создатель!")
 
     await finalize_quiz(quiz_id, chat_id, m.reply_to_message.message_id, creator_id)
@@ -126,7 +111,6 @@ async def manual_finish_quiz_handler(m: types.Message):
 
 @router.message(F.text.lower() == "завершить все")
 async def finish_all_quizzes_private(m: types.Message):
-    logging.info(f"[QUIZ_LOG] Пользователь {m.from_user.id} запросил 'завершить все' в ЛС.")
     if m.chat.type != "private":
         return await m.answer("🫗 Эту команду нужно писать в личные сообщения боту!")
 
@@ -137,7 +121,6 @@ async def finish_all_quizzes_private(m: types.Message):
     )
 
     if not active_quizzes:
-        logging.info(f"[QUIZ_LOG] Активных викторин для пользователя {m.from_user.id} не найдено.")
         return await m.answer("🫙 У вас нет активных викторин.")
 
     count = 0
@@ -145,16 +128,14 @@ async def finish_all_quizzes_private(m: types.Message):
         await finalize_quiz(quiz_id, chat_id, message_id, creator_id)
         count += 1
 
-    logging.info(f"[QUIZ_LOG] Успешно завершено активных викторин: {count}")
     await m.answer(f"✨ Успешно завершено ваших викторин: <b>{count}</b>.")
 
 
 @router.callback_query(F.data.startswith("qans:"))
 async def process_quiz_answer(call: types.CallbackQuery):
-    logging.info(f"[QUIZ_LOG] Получен callback от пользователя {call.from_user.id}: {call.data}")
+    logging.info(f"[QUIZ_LOG] Callback получен: {call.data}")
     data_parts = call.data.split(":")
     if len(data_parts) < 3:
-        logging.error(f"[QUIZ_LOG ERROR] Некорректный формат callback_data: {call.data}")
         return await call.answer("🍋", show_alert=True)
     
     quiz_id = int(data_parts[1])
@@ -164,14 +145,12 @@ async def process_quiz_answer(call: types.CallbackQuery):
 
     quiz = await db_query("SELECT is_active, creator_id, message_id, question FROM quizzes WHERE quiz_id=?", (quiz_id,), fetchone=True)
     if not quiz:
-        logging.warning(f"[QUIZ_LOG] Викторина с ID {quiz_id} вообще не найдена в базе данных при нажатии кнопки!")
+        logging.warning(f"[QUIZ_LOG] Викторина с ID {quiz_id} не найдена в базе!")
         return await call.answer("🍋", show_alert=True)
 
     is_active, creator_id, message_id, question = quiz[0], quiz[1], quiz[2], quiz[3]
-    logging.info(f"[QUIZ_LOG] Состояние викторины {quiz_id}: is_active={is_active}, creator={creator_id}")
 
     if is_active == 0:
-        logging.info(f"[QUIZ_LOG] Попытка ответить на уже завершенную викторину {quiz_id}")
         return await call.answer("🍋", show_alert=True)
 
     if uid == creator_id:
@@ -183,12 +162,7 @@ async def process_quiz_answer(call: types.CallbackQuery):
 
     user_disp_name = await get_display_name(cid, uid, call.from_user.first_name)
 
-    # Сохраняем ответ
-    try:
-        await db_query("INSERT INTO quiz_answers VALUES (?,?,?)", (quiz_id, uid, 1 if is_correct else 0), commit=True)
-        logging.info(f"[QUIZ_LOG] Ответ пользователя {uid} на викторину {quiz_id} успешно записан. Корректность: {is_correct}")
-    except Exception as e:
-        logging.error(f"[QUIZ_LOG ERROR] Не удалось записать ответ пользователя в БД: {e}")
+    await db_query("INSERT INTO quiz_answers VALUES (?,?,?)", (quiz_id, uid, 1 if is_correct else 0), commit=True)
 
     if is_correct:
         await db_query("UPDATE users SET tapes = COALESCE(tapes, 0) + 5 WHERE chat_id=? AND user_id=?", (cid, uid), commit=True)
@@ -200,8 +174,8 @@ async def process_quiz_answer(call: types.CallbackQuery):
                 f"✅ <b>Ваша викторина:</b> {html.quote(question)}\n"
                 f"Пользователь <b>{html.quote(user_disp_name)}</b> (ID: {uid}) ответил(а) <b>ПРАВИЛЬНО</b>!"
             )
-        except TelegramAPIError as e:
-            logging.warning(f"[QUIZ_LOG] Не удалось отправить уведомление создателю в ЛС: {e}")
+        except TelegramAPIError:
+            pass
     else:
         user_tapes_res = await db_query("SELECT tapes FROM users WHERE chat_id=? AND user_id=?", (cid, uid), fetchone=True)
         curr_tapes = (user_tapes_res[0] if user_tapes_res else 0) or 0
@@ -218,24 +192,20 @@ async def process_quiz_answer(call: types.CallbackQuery):
                 f"❌ <b>Ваша викторина:</b> {html.quote(question)}\n"
                 f"Пользователь <b>{html.quote(user_disp_name)}</b> (ID: {uid}) ответил(а) <b>НЕПРАВИЛЬНО</b>! (+{penalty} 📼 вам)"
             )
-        except TelegramAPIError as e:
-            logging.warning(f"[QUIZ_LOG] Не удалось отправить уведомление создателю в ЛС: {e}")
+        except TelegramAPIError:
+            pass
 
-    # Проверяем, ответили ли ВСЕ участники чата
+    # Автозавершение, если ответили все участники
     members = await db_query("SELECT user_id FROM chat_members WHERE chat_id=? AND user_id!=?", (cid, creator_id), fetchall=True) or []
     answers = await db_query("SELECT user_id FROM quiz_answers WHERE quiz_id=?", (quiz_id,), fetchall=True) or []
 
-    logging.info(f"[QUIZ_LOG] Проверка автозавершения викторины {quiz_id}: ответило {len(answers)} из {len(members)} участников.")
     if members and len(answers) >= len(members):
-        logging.info(f"[QUIZ_LOG] Все участники ответили. Автоматически завершаем викторину {quiz_id}.")
         await finalize_quiz(quiz_id, cid, message_id, creator_id)
 
     schedule_sync()
 
 
 async def finalize_quiz(quiz_id: int, chat_id: int, message_id: int, creator_id: int):
-    logging.info(f"[QUIZ_LOG] Вызвана функция finalize_quiz для викторины ID {quiz_id} в чате {chat_id}")
-    
     await db_query("UPDATE quizzes SET is_active=0 WHERE quiz_id=?", (quiz_id,), commit=True)
 
     quiz = await db_query("SELECT question FROM quizzes WHERE quiz_id=?", (quiz_id,), fetchone=True)
@@ -243,7 +213,6 @@ async def finalize_quiz(quiz_id: int, chat_id: int, message_id: int, creator_id:
     vee_name = await get_display_name(chat_id, creator_id, "Vee")
 
     answers = await db_query("SELECT user_id, is_correct FROM quiz_answers WHERE quiz_id=?", (quiz_id,), fetchall=True) or []
-    logging.info(f"[QUIZ_LOG] Всего ответов получено для итогов викторины {quiz_id}: {len(answers)}")
 
     correct_users = []
     incorrect_users = []
@@ -272,24 +241,21 @@ async def finalize_quiz(quiz_id: int, chat_id: int, message_id: int, creator_id:
             message_id=message_id,
             reply_markup=None
         )
-        logging.info(f"[QUIZ_LOG] Сообщение викторины {quiz_id} успешно отредактировано на результаты.")
-    except TelegramAPIError as e:
-        logging.error(f"[QUIZ_LOG ERROR] Не удалось отредактировать сообщение с результатами: {e}")
+    except TelegramAPIError:
+        pass
 
     try:
         await bot.unpin_chat_message(chat_id=chat_id, message_id=message_id)
-        logging.info(f"[QUIZ_LOG] Сообщение викторины {quiz_id} откреплено.")
-    except TelegramAPIError as e:
-        logging.warning(f"[QUIZ_LOG] Не удалось открепить сообщение: {e}")
+    except TelegramAPIError:
+        pass
 
     try:
         await bot.send_message(
             creator_id,
             f"📊 <b>Результаты вашей викторины:</b>\n\n{final_msg}"
         )
-        logging.info(f"[QUIZ_LOG] Результаты отправлены создателю {creator_id} в ЛС.")
-    except TelegramAPIError as e:
-        logging.warning(f"[QUIZ_LOG] Не удалось отправить результаты создателю в ЛС: {e}")
+    except TelegramAPIError:
+        pass
 
     schedule_sync()
     
