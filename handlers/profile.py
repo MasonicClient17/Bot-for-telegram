@@ -120,3 +120,15 @@ async def transfer_tapes_handler(m: types.Message):
     schedule_sync(); await try_delete(m)
     await m.answer(f"🌸 <b>{html.quote(sender_name)}</b> отправил(а) {amount}📼 <b>{html.quote(receiver_name)}</b>")
   
+# Получаем все вещи из инвентаря пользователя для этого чата
+user_items = await db_query(
+    "SELECT item_name FROM inventory WHERE chat_id=? AND user_id=? AND count > 0",
+    (chat_id, user_id),
+    fetchall=True
+)
+
+if user_items:
+    items_list_str = ", ".join([f"<b>{html.quote(item[0])}</b>" for item in user_items])
+    inventory_line = f"🎒 <b>Владеет:</b> {items_list_str}\n"
+else:
+    inventory_line = "" # Если вещей нет, строка пустая
