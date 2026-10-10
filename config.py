@@ -1,41 +1,21 @@
 import os
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip("'\"")
-STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", 0) or 0)
-CREATOR_ID = int(os.getenv("CREATOR_ID", 7350331661))
-DB_FILE = "bot_database.db"
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "0"))
+
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не задан в .env файле!")
 
 bot = Bot(
-    token=BOT_TOKEN, 
+    token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
 
-CALL_EMOJIS = ["🌸", "☁️", "👁", "🐍", "🌫", "🥛", "🫗", "🍨", "🍧", "🌈", "🍇", "🫙"]
-
-DEFAULT_CMD_LEVELS = {
-    "кто я": 0, "профиль": 0, "кассеты": 0,
-    "калл": 0, "call": 0, "созыв": 0,
-    "устав": 0, "правила": 0,
-    "список товаров": 0, "товары": 0, "магазин": 0, "купить": 0,
-    "мои вещи": 0, "инвентарь": 0, "вещь": 0, "использовать": 0,
-    "список браков": 0, "браки": 0,
-    "клиновый сироп": 1, "напоить сиропом": 1, "дать воды": 1, "дать плод всей боли": 1, "+брак": 1, "-брак": 1,
-    "актив": 2, "отругать": 2, "варн": 2, "-варн": 2, "снять варн": 2, "-варны": 2, "снять все варны": 2,
-    "в банку": 3, "банка с джемом": 3, "вытащить из банки": 3,
-    "+тессак": 3, "-тессак": 3, "тессак": 3,
-    "+устав": 3, "+правила": 3, "+приветствие": 3, "-приветствие": 3,
-    "повысить": 3, "понизить": 3,
-    "роль": 4, "сменить": 4, "+вещь": 4
-}
-
-LEVEL_NAMES = {0: "Участник", 1: "Хелпер", 2: "Модератор", 3: "Администратор", 4: "Создатель"}
-
-FORBIDDEN_PATTERNS = [
-    r"правила.*", r"устав.*", r"актив.*", r"стата.*", r"варн.*", r"отругать.*",
-    r"банка.*", r"сироп.*", r"воды.*", r"плод.*", r"ники.*", r"звания.*",
-    r"команды.*", r"повысить.*", r"понизить.*", r"сменить.*", r"приветствие.*", r"профиль.*", r"кто я.*", r"тессак.*", r"кассеты.*"
-]
+DB_FILE = "bot_database.db"
