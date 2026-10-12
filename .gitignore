@@ -1,7 +1,19 @@
-.env
+# База данных SQLite
 *.db
 *.sqlite3
-__pycache__/
-*.pyc
-.venv/
+
+# Переменные окружения и виртуальные окружения
+.env
 venv/
+env/
+ENV/
+.venv/
+
+# Кэш Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Настройки редакторов
+.vscode/
+.idea/
