@@ -7,7 +7,17 @@ router = Router()
 
 @router.message(F.document, F.chat.type == "private")
 async def import_json_backup(m: types.Message):
+    # Диагностика: если CREATOR_ID не задан в Railway
+    if SUPERUSER_ID == 0:
+        await m.answer(
+            f"⚠️ <b>В настройках Railway не задана переменная <code>CREATOR_ID</code>!</b>\n\n"
+            f"Ваш Telegram ID: <code>{m.from_user.id}</code>\n"
+            f"Добавьте эту переменную в разделе Variables в Railway, чтобы бот признал в вас создателя."
+        )
+        return
+
     if m.from_user.id != SUPERUSER_ID:
+        await m.answer(f"🌫️ Недостаточно прав. Ваш ID: {m.from_user.id}, а CREATOR_ID: {SUPERUSER_ID}")
         return
     
     document = m.document
@@ -54,4 +64,4 @@ async def import_json_backup(m: types.Message):
         await db_query("INSERT OR REPLACE INTO cmd_levels (chat_id, cmd_name, min_lvl) VALUES (?, ?, ?)", row, commit=True)
 
     await m.answer("✨ <b>Старый бэкап успешно импортирован!</b> Все данные, участники и кастомные команды перенесены в новую базу SQLite.")
-  
+    
