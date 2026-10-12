@@ -1,8 +1,10 @@
+from datetime import datetime
 from aiogram import Router, F, types
 from config import bot, GROUP_ID
 from database import db_query
 from utils import (
     is_authorized_chat,
+    is_any_command,
     get_text,
     get_cmd_name,
     check_access,
@@ -12,12 +14,10 @@ from utils import (
 
 router = Router()
 
-# Кэш сессий проверки норм: {admin_id: [user_ids]}
 ACTIVE_NORMS = {}
 
 @router.message(F.text)
 async def norms_handler(m: types.Message):
-    # 1. Настройка личного напоминания в ЛС бота
     if m.chat.type == "private":
         text = m.text.strip()
         text_lower = text.lower()
@@ -39,7 +39,6 @@ async def norms_handler(m: types.Message):
             return
         return
 
-    # 2. Обработка команды проверки нормы в групповом чате
     if not await is_authorized_chat(m.chat.id):
         return
 
@@ -56,11 +55,9 @@ async def norms_handler(m: types.Message):
 
     await try_delete(m)
 
-    # Получаем минимальную норму чата
     norm_row = await db_query("SELECT min_messages FROM chat_norms WHERE chat_id=?", (m.chat.id,), fetchone=True)
     min_norm = norm_row[0] if norm_row else 10
 
-    # Находим должников
     rows = await db_query(
         "SELECT user_id, msg_count FROM users WHERE chat_id=? AND msg_count < ?",
         (m.chat.id, min_norm),
@@ -177,7 +174,7 @@ async def norm_callback_handler(call: types.CallbackQuery):
             await bot.send_message(target_id, f"🌌 <b>Напоминание от администрации:</b>\n{reminder_text}")
             await call.answer("Напоминание отправлено в личные сообщения участнику!", show_alert=True)
         except Exception:
-            await call.answer("Не удалось отправить сообщение (возможно, бот заблокирован пользователем).", show_alert=True)
+            await call.answer("Не удалось отправить сообщение.", show_alert=True)
 
     elif action == "ban":
         try:
@@ -194,4 +191,43 @@ async def norm_callback_handler(call: types.CallbackQuery):
             await call.message.edit_text(text_content, reply_markup=keyboard)
         except Exception as e:
             await call.answer(f"Ошибка при бане: {e}", show_alert=True)
-  
+
+
+# --- УНИВЕРСАЛЬНЫЙ СЧЕТЧИК СООБЩЕНИЙ (Всегда в самом конце) ---
+@router.message(F.text)
+async def message_counter_handler(m: types.Message):
+    if not await is_authorized_chat(m.chat.id):
+        return
+
+    if await is_any_command(m.chat.id, m.text):
+        return
+
+    username = m.from_user.username or ""
+    first_name = m.from_user.first_name or "Участник"
+    
+    await db_query(
+        "INSERT OR REPLACE INTO chat_members (chat_id, user_id, first_name, username) VALUES (?,?,?,?)",
+        (m.chat.id, m.from_user.id, first_name, username),
+        commit=True
+    )
+
+    today_str = datetime.now().strftime("%d.%m.%Y")
+    user_data = await db_query(
+        "SELECT 1 FROM users WHERE chat_id=? AND user_id=?",
+        (m.chat.id, m.from_user.id),
+        fetchone=True
+    )
+
+    if not user_data:
+        await db_query(
+            "INSERT INTO users (chat_id, user_id, role_level, warns, msg_count, rp_name, day_count, week_count, last_msg_date, week_number, joined_at, tapes, status, rep) VALUES (?,?,0,0,1,?,1,1,?,?,?,0,?,0)",
+            (m.chat.id, m.from_user.id, first_name, today_str, str(datetime.now().isocalendar()[1]), today_str, "Новичок"),
+            commit=True
+        )
+    else:
+        await db_query(
+            "UPDATE users SET msg_count = msg_count + 1 WHERE chat_id=? AND user_id=?",
+            (m.chat.id, m.from_user.id),
+            commit=True
+        )
+        
