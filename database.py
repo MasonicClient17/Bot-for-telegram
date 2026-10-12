@@ -116,7 +116,7 @@ async def init_db():
                 PRIMARY KEY (chat_id, command_name)
             )
         """)
-                await db.execute("""
+        await db.execute("""
             CREATE TABLE IF NOT EXISTS user_tags (
                 chat_id INTEGER,
                 user_id INTEGER,
@@ -146,7 +146,6 @@ async def init_db():
                 PRIMARY KEY (quiz_id, user_id)
             )
         """)
-        
         await db.commit()
 
 async def backup_to_telegram():
