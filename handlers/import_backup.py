@@ -7,12 +7,11 @@ router = Router()
 
 @router.message(F.document, F.chat.type == "private")
 async def import_json_backup(m: types.Message):
-    # Диагностика: если CREATOR_ID не задан в Railway
     if SUPERUSER_ID == 0:
         await m.answer(
             f"⚠️ <b>В настройках Railway не задана переменная <code>CREATOR_ID</code>!</b>\n\n"
             f"Ваш Telegram ID: <code>{m.from_user.id}</code>\n"
-            f"Добавьте эту переменную в разделе Variables в Railway, чтобы бот признал в вас создателя."
+            f"Добавьте эту переменную в переменные окружения Railway."
         )
         return
 
@@ -25,10 +24,10 @@ async def import_json_backup(m: types.Message):
         await m.answer("🌫️ Пожалуйста, отправьте JSON-файл бэкапа.")
         return
 
-    file_info = await m.bot.get_file(document.file_id)
-    file_bytes = await m.bot.download_file(file_info.file_path)
-    
     try:
+        file_info = await m.bot.get_file(document.file_id)
+        file_io = await m.bot.download_file(file_info.file_path)
+        file_bytes = file_io.getvalue()
         data = json.loads(file_bytes.decode("utf-8"))
     except Exception as e:
         await m.answer(f"🌫️ Ошибка чтения JSON: {e}")
