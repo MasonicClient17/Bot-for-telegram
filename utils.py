@@ -1,4 +1,3 @@
-import re
 from typing import Optional
 from aiogram import types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -7,24 +6,20 @@ from database import db_query
 from phrases import DEFAULT_COMMANDS, DEFAULT_PHRASES
 
 async def is_authorized_chat(chat_id: int) -> bool:
-    """Проверяет, работает ли бот в разрешенном чате."""
     if chat_id in (GROUP_ID, STORAGE_CHAT_ID):
         return True
     return False
 
 async def get_text(chat_id: int, key: str, **kwargs) -> str:
-    """Возвращает динамический текст из БД или из phrases.py по умолчанию."""
     res = await db_query("SELECT text_value FROM dynamic_phrases WHERE chat_id=? AND key_name=?", (chat_id, key), fetchone=True)
     text = res[0] if res else DEFAULT_PHRASES.get(key, f"[{key}]")
     return text.format(**kwargs) if kwargs else text
 
 async def get_cmd_name(chat_id: int, action_key: str) -> str:
-    """Возвращает переименованный триггер команды или значение по умолчанию."""
     res = await db_query("SELECT cmd_name FROM dynamic_commands WHERE chat_id=? AND action_key=?", (chat_id, action_key), fetchone=True)
     return res[0] if res else DEFAULT_COMMANDS.get(action_key, action_key)
 
 async def get_user_lvl(chat_id: int, user_id: int) -> int:
-    """Возвращает уровень прав пользователя (0 - обычный, 1 - хелпер, 2 - модер, 3 - админ, 4 - суперпользователь)."""
     if user_id == SUPERUSER_ID:
         return 4
     
@@ -36,7 +31,6 @@ async def get_user_lvl(chat_id: int, user_id: int) -> int:
     return res_user[0] if (res_user and res_user[0] is not None) else 0
 
 async def check_access(message: types.Message, action_key: str) -> bool:
-    """Проверяет права доступа пользователя к команде."""
     if not await is_authorized_chat(message.chat.id):
         return False
         
@@ -49,9 +43,11 @@ async def check_access(message: types.Message, action_key: str) -> bool:
     return user_lvl >= min_lvl
 
 async def resolve_target(message: types.Message) -> Optional[int]:
-    """Извлекает ID целевого пользователя из ответа на сообщение или упоминания через @username."""
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user.id
+        
+    if not message.text:
+        return None
         
     args = message.text.split()
     if len(args) > 1:
@@ -68,14 +64,12 @@ async def resolve_target(message: types.Message) -> Optional[int]:
     return None
 
 async def try_delete(message: types.Message):
-    """Безопасно удаляет сообщение пользователя, чтобы не засорять чат."""
     try:
         await message.delete()
     except Exception:
         pass
 
 def get_norm_keyboard(target_id: int, page: int, total: int) -> InlineKeyboardMarkup:
-    """Генерирует инлайн-панель управления личным делом не сдавшего норму."""
     buttons = [
         [
             InlineKeyboardButton(text="<", callback_data=f"norm_page:{page - 1}"),
@@ -93,17 +87,14 @@ def get_norm_keyboard(target_id: int, page: int, total: int) -> InlineKeyboardMa
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def is_any_command(chat_id: int, text: str) -> bool:
-    """Универсальная проверка: является ли текст командой, RP-действием или системным триггером."""
     if not text:
         return False
     text_strip = text.strip()
     text_lower = text_strip.lower()
     
-    # 1. Исключаем RP-форматирование и системные префиксы (*, /, !, ., +, -)
     if text_strip.startswith(("/", "!", ".", "+", "-", "*")):
         return True
         
-    # 2. Берем первое слово (токен) сообщения для точного сравнения с командами
     first_word = text_lower.split()[0] if text_lower.split() else ""
     
     action_keys = ["ban", "mute", "unmute", "warn", "unwarn", "marry", "divorce", "profile", "whoami", "whois", "save", "norm", "reminder"]
@@ -121,7 +112,6 @@ async def is_any_command(chat_id: int, text: str) -> bool:
     if first_word in ("изменить", "напоминание"):
         return True
         
-    # 3. Проверка пользовательских (кастомных) команд из базы данных (точное совпадение первого слова)
     custom = await db_query("SELECT 1 FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (chat_id, first_word), fetchone=True)
     if custom:
         return True
