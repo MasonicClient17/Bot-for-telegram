@@ -1,5 +1,5 @@
 # Centralized text templates and command triggers using the new emoji style:
-# ☁️🪼🌌🌃📺📷📸📞🩻📃📼🎇🌫️
+# ☁️🪼🌌🌃📺📷📸📞🩻📃📼🎇🌫️  
 DEFAULT_COMMANDS = {
     "ban": "бан",
     "mute": "мут",
@@ -34,17 +34,6 @@ DEFAULT_PHRASES = {
     "cmd_changed": "🌃 Команда успешно переименована!\nСтарое название: <code>{old_cmd}</code>\nНовое название: <code>{new_cmd}</code>",
     "profile": (
         "🪼 <b>Личное дело участника: {user}</b>\n\n"
-        "📅 В клубе с: <code>{joined_at}</code>\n"
-        "📼 Ленты: <b>{tapes}</b>\n"
-        "💬 Сообщений: <b>{msg_count}</b> (Мин. норма: {min_norm})\n"
-        "✨ Статус: <i>{status}</i>\n"
-        "⭐ Репутация: <b>{rep}</b>"
-    ),
-    "norm_completed_all": "🌃 Все активные участники успешно выполнили дневную норму сообщений!",
-    "reminder_default": "Привет! Ты еще не выполнил норму сообщений в чате. Пожалуйста, прояви активность! 🌌",
-    "reminder_set_success": "🌃 Текст твоего индивидуального напоминания успешно сохранен!"
-}
-
         "📅 В клубе с: <code>{joined_at}</code>\n"
         "📼 Ленты: <b>{tapes}</b>\n"
         "💬 Сообщений: <b>{msg_count}</b> (Мин. норма: {min_norm})\n"
