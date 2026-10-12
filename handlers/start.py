@@ -3,9 +3,9 @@ from aiogram import Router, F, types
 from aiogram.filters import Command
 from config import STORAGE_CHAT_ID
 from database import db_query, backup_to_telegram
-from phrases import DEFAULT_COMMANDS
 from utils import (
     is_authorized_chat,
+    is_any_command,
     get_text,
     get_cmd_name,
     resolve_target,
@@ -26,38 +26,8 @@ async def process_start_and_profile(m: types.Message):
     if not await is_authorized_chat(m.chat.id):
         return
 
-    # Сохраняем/обновляем участника чата
-    username = m.from_user.username or ""
-    first_name = m.from_user.first_name or "Участник"
-    await db_query(
-        "INSERT OR REPLACE INTO chat_members (chat_id, user_id, first_name, username) VALUES (?,?,?,?)",
-        (m.chat.id, m.from_user.id, first_name, username),
-        commit=True
-    )
-
-    # Инициализация пользователя при первом сообщении
-    user_data = await db_query(
-        "SELECT msg_count, joined_at, tapes, status, rep FROM users WHERE chat_id=? AND user_id=?",
-        (m.chat.id, m.from_user.id),
-        fetchone=True
-    )
-
-    today_str = datetime.now().strftime("%d.%m.%Y")
-    if not user_data:
-        await db_query(
-            "INSERT INTO users (chat_id, user_id, role_level, warns, msg_count, rp_name, day_count, week_count, last_msg_date, week_number, joined_at, tapes, status, rep) VALUES (?,?,0,0,1,?,1,1,?,?,?,0,?,0)",
-            (m.chat.id, m.from_user.id, first_name, today_str, str(datetime.now().isocalendar()[1]), today_str, "Новичок"),
-            commit=True
-        )
-    else:
-        # Увеличиваем счетчик сообщений
-        await db_query(
-            "UPDATE users SET msg_count = msg_count + 1 WHERE chat_id=? AND user_id=?",
-            (m.chat.id, m.from_user.id),
-            commit=True
-        )
-
     text_lower = m.text.lower().strip()
+    is_cmd = await is_any_command(m.chat.id, m.text)
 
     # --- Команда сохранения бэкапа (/save) ---
     save_trigger = await get_cmd_name(m.chat.id, "save")
@@ -103,7 +73,7 @@ async def process_start_and_profile(m: types.Message):
         )
 
         user_name = member_row[0] if member_row else "Участник"
-        joined_at = target_row[0] if target_row else today_str
+        joined_at = target_row[0] if target_row else datetime.now().strftime("%d.%m.%Y")
         tapes = target_row[1] if target_row else 0
         msg_count = target_row[2] if target_row else 0
         status = target_row[3] if target_row else "Участник"
@@ -123,4 +93,38 @@ async def process_start_and_profile(m: types.Message):
         )
         
         await m.answer(profile_text)
+        return
+
+    # --- ЖЕЛЕЗОБЕТОННЫЙ ФИЛЬТР: Если это любая команда или RP-действие — НЕ засчитываем в сообщения ---
+    if is_cmd:
+        return
+
+    # --- Учет сообщений ТОЛЬКО для обычного текста участников ---
+    username = m.from_user.username or ""
+    first_name = m.from_user.first_name or "Участник"
+    await db_query(
+        "INSERT OR REPLACE INTO chat_members (chat_id, user_id, first_name, username) VALUES (?,?,?,?)",
+        (m.chat.id, m.from_user.id, first_name, username),
+        commit=True
+    )
+
+    today_str = datetime.now().strftime("%d.%m.%Y")
+    user_data = await db_query(
+        "SELECT 1 FROM users WHERE chat_id=? AND user_id=?",
+        (m.chat.id, m.from_user.id),
+        fetchone=True
+    )
+
+    if not user_data:
+        await db_query(
+            "INSERT INTO users (chat_id, user_id, role_level, warns, msg_count, rp_name, day_count, week_count, last_msg_date, week_number, joined_at, tapes, status, rep) VALUES (?,?,0,0,1,?,1,1,?,?,?,0,?,0)",
+            (m.chat.id, m.from_user.id, first_name, today_str, str(datetime.now().isocalendar()[1]), today_str, "Новичок"),
+            commit=True
+        )
+    else:
+        await db_query(
+            "UPDATE users SET msg_count = msg_count + 1 WHERE chat_id=? AND user_id=?",
+            (m.chat.id, m.from_user.id),
+            commit=True
+        )
         
