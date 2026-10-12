@@ -108,6 +108,14 @@ async def init_db():
                 PRIMARY KEY (chat_id, user_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS custom_commands (
+                chat_id INTEGER,
+                command_name TEXT,
+                response_text TEXT,
+                PRIMARY KEY (chat_id, command_name)
+            )
+        """)
         await db.commit()
 
 async def backup_to_telegram():
@@ -118,15 +126,5 @@ async def backup_to_telegram():
         await bot.send_document(STORAGE_CHAT_ID, document=FSInputFile(DB_NAME), caption="💾 Автоматический бэкап базы данных")
 
 async def restore_from_telegram():
-    if not STORAGE_CHAT_ID:
-        return
-    try:
-        messages = await bot.get_chat_history(STORAGE_CHAT_ID, limit=5)
-        for msg in messages:
-            if msg.document and msg.document.file_name == DB_NAME:
-                file = await bot.get_file(msg.document.file_id)
-                await bot.download_file(file.file_path, DB_NAME)
-                break
-    except Exception:
-        pass
-        
+    pass
+    
