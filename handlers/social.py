@@ -1,82 +1,123 @@
 from datetime import datetime
-from aiogram import Router, F, types, html
+from aiogram import Router, F, types
 from database import db_query
-from utils import check_access, get_user_lvl, get_display_name, try_delete, schedule_sync
+from utils import (
+    is_authorized_chat,
+    get_text,
+    get_cmd_name,
+    resolve_target,
+    try_delete
+)
 
 router = Router()
 
-@router.message(F.text.startswith("+брак"))
-async def create_marriage_handler(m: types.Message):
-    u_lvl = await get_user_lvl(m.chat.id, m.from_user.id)
-    inv_item = await db_query("SELECT count FROM inventory WHERE chat_id=? AND user_id=? AND LOWER(item_name)='бессрочное бракосочетание' AND count > 0", (m.chat.id, m.from_user.id), fetchone=True)
-    if u_lvl < 1 and not inv_item:
-        return await m.answer("🌫 У вас нет прав для создания браков или предмета 'Бессрочное бракосочетание'!")
+# Временный словарь для хранения предложений брака: {(chat_id, target_id): initiator_id}
+PENDING_MARRIAGES = {}
 
-    u1_id, u2_id = None, None
-    if m.reply_to_message and m.reply_to_message.from_user:
-        u1_id, u2_id = m.from_user.id, m.reply_to_message.from_user.id
-    else:
-        mentions = []
-        if m.entities:
-            for entity in m.entities:
-                if entity.type == "text_mention" and entity.user: mentions.append(entity.user.id)
-                elif entity.type == "mention":
-                    un = m.text[entity.offset:entity.offset + entity.length].lstrip("@").lower().strip()
-                    res = await db_query("SELECT user_id FROM chat_members WHERE chat_id=? AND LOWER(username)=?", (m.chat.id, un), fetchone=True)
-                    if res: mentions.append(res[0])
-        if len(mentions) >= 2: u1_id, u2_id = mentions[0], mentions[1]
+@router.message(F.text)
+async def social_handler(m: types.Message):
+    if not await is_authorized_chat(m.chat.id):
+        return
 
-    if not u1_id or not u2_id: return await m.answer("🫗 Использование: <code>+брак @user1 @user2</code> или <code>+брак</code> ответом!")
-    if u1_id == u2_id: return await m.answer("🫗 Нельзя заключить брак с самим собой!")
+    text = m.text.strip()
+    args = text.split()
+    if not args:
+        return
 
-    if await db_query("SELECT * FROM marriages WHERE chat_id=? AND ((user1_id=? OR user2_id=?) OR (user1_id=? OR user2_id=?))", (m.chat.id, u1_id, u1_id, u2_id, u2_id), fetchone=True):
-        return await m.answer("🌸 Один из участников уже состоит в браке!")
+    cmd_candidate = args[0].lower()
 
-    if u_lvl < 1 and inv_item:
-        await db_query("UPDATE inventory SET count = count - 1 WHERE chat_id=? AND user_id=? AND LOWER(item_name)='бессрочное бракосочетание'", (m.chat.id, m.from_user.id), commit=True)
+    c_marry = await get_cmd_name(m.chat.id, "marry")
+    c_divorce = await get_cmd_name(m.chat.id, "divorce")
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    await db_query("INSERT INTO marriages VALUES (?,?,?,?)", (m.chat.id, u1_id, u2_id, today_str), commit=True)
-    n1 = await get_display_name(m.chat.id, u1_id, f"ID:{u1_id}")
-    n2 = await get_display_name(m.chat.id, u2_id, f"ID:{u2_id}")
+    if cmd_candidate not in (c_marry.lower(), c_divorce.lower()):
+        return
 
-    schedule_sync(); await try_delete(m)
-    await m.answer(f"💍 <b>Совет да любовь!</b> Объявлен новый союз между <b>{html.quote(n1)}</b> и <b>{html.quote(n2)}</b>! 💕")
+    await try_delete(m)
 
-@router.message(F.text.startswith("-брак"))
-async def remove_marriage_handler(m: types.Message):
-    if not await check_access(m, "+брак"): return
-    u1_id, u2_id = None, None
-    if m.reply_to_message and m.reply_to_message.from_user:
-        u1_id, u2_id = m.from_user.id, m.reply_to_message.from_user.id
-    else:
-        mentions = []
-        if m.entities:
-            for entity in m.entities:
-                if entity.type == "text_mention" and entity.user: mentions.append(entity.user.id)
-                elif entity.type == "mention":
-                    un = m.text[entity.offset:entity.offset + entity.length].lstrip("@").lower().strip()
-                    res = await db_query("SELECT user_id FROM chat_members WHERE chat_id=? AND LOWER(username)=?", (m.chat.id, un), fetchone=True)
-                    if res: mentions.append(res[0])
-        if len(mentions) >= 2: u1_id, u2_id = mentions[0], mentions[1]
+    # Обработка развода (-брак)
+    if cmd_candidate == c_divorce.lower():
+        marriage = await db_query(
+            "SELECT user1_id, user2_id FROM marriages WHERE chat_id=? AND (user1_id=? OR user2_id=?)",
+            (m.chat.id, m.from_user.id, m.from_user.id),
+            fetchone=True
+        )
+        if not marriage:
+            await m.answer("🌫️ Вы не состоите в браке.")
+            return
 
-    if not u1_id or not u2_id: return await m.answer("🫗 Использование: <code>-брак @user1 @user2</code> или <code>-брак</code> ответом!")
+        u1, u2 = marriage
+        partner_id = u2 if u1 == m.from_user.id else u1
 
-    await db_query("DELETE FROM marriages WHERE chat_id=? AND ((user1_id=? AND user2_id=?) OR (user1_id=? AND user2_id=?))", (m.chat.id, u1_id, u2_id, u2_id, u1_id), commit=True)
-    schedule_sync(); await try_delete(m)
-    await m.answer("💔 Брак был успешно расторгнут.")
+        await db_query(
+            "DELETE FROM marriages WHERE chat_id=? AND ((user1_id=? AND user2_id=?) OR (user1_id=? AND user2_id=?))",
+            (m.chat.id, u1, u2, u2, u1),
+            commit=True
+        )
 
-@router.message(F.text.lower().in_(["список браков", "браки"]))
-async def list_marriages_handler(m: types.Message):
-    if not await check_access(m, "список браков"): return
-    marriages = await db_query("SELECT user1_id, user2_id, date FROM marriages WHERE chat_id=?", (m.chat.id,), fetchall=True)
-    if not marriages: return await m.answer("🫙 В этом чате пока нет зарегистрированных браков.")
+        m1 = await db_query("SELECT first_name FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, m.from_user.id), fetchone=True)
+        m2 = await db_query("SELECT first_name FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, partner_id), fetchone=True)
+        name1 = m1[0] if m1 else "Участник"
+        name2 = m2[0] if m2 else "Участник"
 
-    txt = "💍 <b>Список любовных союзов чата:</b>\n\n"
-    for idx, (u1, u2, mdate) in enumerate(marriages, 1):
-        n1 = await get_display_name(m.chat.id, u1, f"ID:{u1}")
-        n2 = await get_display_name(m.chat.id, u2, f"ID:{u2}")
-        txt += f"{idx}. 💕 <b>{html.quote(n1)}</b> + <b>{html.quote(n2)}</b> <i>(с {mdate})</i>\n"
+        divorce_text = await get_text(m.chat.id, "divorce_success", user=name1, target=name2)
+        await m.answer(divorce_text)
+        return
 
-    await try_delete(m); await m.answer(txt)
-  
+    # Обработка принятия предложения брака (+брак в ответ или при наличии приглашения)
+    if (m.chat.id, m.from_user.id) in PENDING_MARRIAGES:
+        initiator_id = PENDING_MARRIAGES.pop((m.chat.id, m.from_user.id))
+        
+        m_check = await db_query(
+            "SELECT 1 FROM marriages WHERE chat_id=? AND (user1_id=? OR user2_id=? OR user1_id=? OR user2_id=?)",
+            (m.chat.id, initiator_id, initiator_id, m.from_user.id, m.from_user.id),
+            fetchone=True
+        )
+        if m_check:
+            await m.answer("🌫️ Один из участников уже состоит в браке.")
+            return
+
+        today_str = datetime.now().strftime("%d.%m.%Y")
+        await db_query(
+            "INSERT INTO marriages (chat_id, user1_id, user2_id, date) VALUES (?,?,?,?)",
+            (m.chat.id, initiator_id, m.from_user.id, today_str),
+            commit=True
+        )
+
+        m1 = await db_query("SELECT first_name FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, initiator_id), fetchone=True)
+        m2 = await db_query("SELECT first_name FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, m.from_user.id), fetchone=True)
+        name1 = m1[0] if m1 else "Участник"
+        name2 = m2[0] if m2 else "Участник"
+
+        success_text = await get_text(m.chat.id, "marry_success", user=name1, target=name2)
+        await m.answer(success_text)
+        return
+
+    # Отправка нового предложения брака
+    target_id = await resolve_target(m)
+    if not target_id:
+        await m.answer("🌫️ Укажите участника для заключения брака (через @ или ответом на сообщение).")
+        return
+
+    if target_id == m.from_user.id:
+        await m.answer("🌫️ Нельзя заключить брак с самим собой.")
+        return
+
+    m_check = await db_query(
+        "SELECT 1 FROM marriages WHERE chat_id=? AND (user1_id=? OR user2_id=? OR user1_id=? OR user2_id=?)",
+        (m.chat.id, m.from_user.id, m.from_user.id, target_id, target_id),
+        fetchone=True
+    )
+    if m_check:
+        await m.answer("🌫️ Вы или выбранный участник уже состоите в браке.")
+        return
+
+    PENDING_MARRIAGES[(m.chat.id, target_id)] = m.from_user.id
+
+    m1 = await db_query("SELECT first_name FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, m.from_user.id), fetchone=True)
+    m2 = await db_query("SELECT first_name FROM chat_members WHERE chat_id=? AND user_id=?", (m.chat.id, target_id), fetchone=True)
+    name1 = m1[0] if m1 else "Участник"
+    name2 = m2[0] if m2 else "Участник"
+
+    req_text = await get_text(m.chat.id, "marry_req", user=name1, target=name2)
+    await m.answer(req_text)
+    
