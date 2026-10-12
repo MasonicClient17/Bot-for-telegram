@@ -91,4 +91,38 @@ def get_norm_keyboard(target_id: int, page: int, total: int) -> InlineKeyboardMa
         ]
     ]
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def is_any_command(chat_id: int, text: str) -> bool:
+    """Универсальная проверка: является ли текст командой, RP-действием или системным триггером."""
+    if not text:
+        return False
+    text_lower = text.strip().lower()
+    
+    # 1. Любые символы команд и RP-форматирования (*, /, +, -, !, .)
+    if text.startswith(("/", "!", ".", "+", "-", "*")):
+        return True
+        
+    # 2. Проверка стандартных и переименованных команд чата
+    action_keys = ["ban", "mute", "unmute", "warn", "unwarn", "marry", "divorce", "profile", "whoami", "whois", "save", "norm", "reminder"]
+    for key in action_keys:
+        cmd_name = await get_cmd_name(chat_id, key)
+        if text_lower.startswith(cmd_name.lower()):
+            return True
+            
+    if text_lower.startswith("разбан"):
+        return True
+        
+    if text_lower in ("печенька", "cookie", "+печенька"):
+        return True
+        
+    if text_lower.startswith("изменить") or text_lower.startswith("напоминание"):
+        return True
+        
+    # 3. Проверка пользовательских (кастомных) команд из базы данных
+    first_word = text_lower.split()[0] if text_lower.split() else ""
+    custom = await db_query("SELECT 1 FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (chat_id, first_word), fetchone=True)
+    if custom:
+        return True
+        
+    return False
     
