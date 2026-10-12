@@ -1,6 +1,7 @@
 import re
-from typing import Optional, Union
+from typing import Optional
 from aiogram import types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from config import GROUP_ID, STORAGE_CHAT_ID, SUPERUSER_ID
 from database import db_query
 from phrases import DEFAULT_COMMANDS, DEFAULT_PHRASES
@@ -72,4 +73,22 @@ async def try_delete(message: types.Message):
         await message.delete()
     except Exception:
         pass
-      
+
+def get_norm_keyboard(target_id: int, page: int, total: int) -> InlineKeyboardMarkup:
+    """Генерирует инлайн-панель управления личным делом не сдавшего норму."""
+    buttons = [
+        [
+            InlineKeyboardButton(text="<", callback_data=f"norm_page:{page - 1}"),
+            InlineKeyboardButton(text="Игнорировать", callback_data=f"norm_ignore:{target_id}:{page}"),
+            InlineKeyboardButton(text=">", callback_data=f"norm_page:{page + 1}")
+        ],
+        [
+            InlineKeyboardButton(text="Предупредить", callback_data=f"norm_warn:{target_id}:{page}"),
+            InlineKeyboardButton(text="Напомнить", callback_data=f"norm_remind:{target_id}:{page}")
+        ],
+        [
+            InlineKeyboardButton(text="Забанить", callback_data=f"norm_ban:{target_id}:{page}")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+    
