@@ -12,7 +12,7 @@ except ImportError:
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 STORAGE_CHAT_ID = int(os.getenv("STORAGE_CHAT_ID", "0"))
 GROUP_ID = int(os.getenv("GROUP_ID", "0"))
-SUPERUSER_ID = int(os.getenv("CREATOR_ID", "0"))
+SUPERUSER_ID = int(os.getenv("CREATOR_ID", os.getenv("USER_ID", "0")))
 
 if not BOT_TOKEN:
     raise ValueError("❌ BOT_TOKEN не задан в переменных окружения!")
@@ -22,5 +22,3 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
-
-DB_FILE = "bot_database.db"
