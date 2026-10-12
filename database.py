@@ -116,6 +116,37 @@ async def init_db():
                 PRIMARY KEY (chat_id, command_name)
             )
         """)
+                await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_tags (
+                chat_id INTEGER,
+                user_id INTEGER,
+                tag TEXT,
+                PRIMARY KEY (chat_id, user_id, tag)
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS quizzes (
+                quiz_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                message_id INTEGER,
+                creator_id INTEGER,
+                question TEXT,
+                correct_answer TEXT,
+                status INTEGER DEFAULT 1,
+                created_at TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS quiz_answers (
+                quiz_id INTEGER,
+                user_id INTEGER,
+                user_name TEXT,
+                answer TEXT,
+                is_correct INTEGER,
+                PRIMARY KEY (quiz_id, user_id)
+            )
+        """)
+        
         await db.commit()
 
 async def backup_to_telegram():
