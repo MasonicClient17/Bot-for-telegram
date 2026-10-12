@@ -96,30 +96,32 @@ async def is_any_command(chat_id: int, text: str) -> bool:
     """Универсальная проверка: является ли текст командой, RP-действием или системным триггером."""
     if not text:
         return False
-    text_lower = text.strip().lower()
+    text_strip = text.strip()
+    text_lower = text_strip.lower()
     
-    # 1. Любые символы команд и RP-форматирования (*, /, +, -, !, .)
-    if text.startswith(("/", "!", ".", "+", "-", "*")):
+    # 1. Исключаем RP-форматирование и системные префиксы (*, /, !, ., +, -)
+    if text_strip.startswith(("/", "!", ".", "+", "-", "*")):
         return True
         
-    # 2. Проверка стандартных и переименованных команд чата
+    # 2. Берем первое слово (токен) сообщения для точного сравнения с командами
+    first_word = text_lower.split()[0] if text_lower.split() else ""
+    
     action_keys = ["ban", "mute", "unmute", "warn", "unwarn", "marry", "divorce", "profile", "whoami", "whois", "save", "norm", "reminder"]
     for key in action_keys:
         cmd_name = await get_cmd_name(chat_id, key)
-        if text_lower.startswith(cmd_name.lower()):
+        if first_word == cmd_name.lower():
             return True
             
-    if text_lower.startswith("разбан"):
+    if first_word == "разбан":
         return True
         
-    if text_lower in ("печенька", "cookie", "+печенька"):
+    if first_word in ("печенька", "cookie", "+печенька"):
         return True
         
-    if text_lower.startswith("изменить") or text_lower.startswith("напоминание"):
+    if first_word in ("изменить", "напоминание"):
         return True
         
-    # 3. Проверка пользовательских (кастомных) команд из базы данных
-    first_word = text_lower.split()[0] if text_lower.split() else ""
+    # 3. Проверка пользовательских (кастомных) команд из базы данных (точное совпадение первого слова)
     custom = await db_query("SELECT 1 FROM custom_commands WHERE chat_id=? AND LOWER(command_name)=?", (chat_id, first_word), fetchone=True)
     if custom:
         return True
