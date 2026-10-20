@@ -1,13 +1,9 @@
-# База данных (чтобы не затирать локальной базой бэкапы на сервере)
-*.db
-*.sqlite3
-
-# Кэш Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# Окружение и секреты
 .env
+database.db
 .venv/
 venv/
+.idea/
+.vscode/
