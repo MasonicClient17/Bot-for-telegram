@@ -1,12 +1,17 @@
 import os
-from aiogram import Router, F, Bot
+import logging
+from aiogram import Router, F, Bot, types
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import Command, CommandObject
 from db import Database
 import phrases
 
 router = Router()
-SYSTEM_COMMANDS = {"мут", "размут", "варн", "бан", "снять", "модер", "актив", "ник", "тэг", "команды", "save"}
+
+SYSTEM_COMMANDS = {
+    "мут", "размут", "варн", "бан", "снять", 
+    "модер", "актив", "ник", "тэг", "команды", "save"
+}
 
 def get_creator_id() -> int:
     return int(os.getenv("CREATOR_ID", "0"))
@@ -14,14 +19,26 @@ def get_creator_id() -> int:
 def get_storage_chat_id() -> int:
     return int(os.getenv("STORAGE_CHAT_ID", "0"))
 
+async def try_delete_command_message(message: Message):
+    """Вспомогательная функция для авто-удаления текста команды пользователя."""
+    if message.chat.type in ["group", "supergroup"]:
+        try:
+            await message.delete()
+        except Exception as e:
+            logging.debug(f"Не удалось удалить сообщение с командой: {e}")
+
+# --- Публичные и системные команды ---
+
 @router.message(Command("start"))
 async def cmd_start(message: Message):
+    await try_delete_command_message(message)
     await message.answer(phrases.START_MESSAGE)
 
 # --- Управление РП-никами и Тэгами ---
 
 @router.message(F.text.startswith("+ник"))
 async def cmd_set_rp_name(message: Message, db: Database):
+    await try_delete_command_message(message)
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         return
@@ -32,11 +49,13 @@ async def cmd_set_rp_name(message: Message, db: Database):
 @router.message(Command("ник"))
 @router.message(F.text == "-ник")
 async def cmd_reset_rp_name(message: Message, db: Database):
+    await try_delete_command_message(message)
     await db.set_rp_name(message.chat.id, message.from_user.id, "")
     await message.answer(phrases.RP_NAME_RESET)
 
 @router.message(F.text.startswith("тэг"))
 async def cmd_set_tag(message: Message, db: Database):
+    await try_delete_command_message(message)
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3:
         await message.answer(phrases.ERR_USER_NOT_FOUND)
@@ -51,11 +70,11 @@ async def cmd_set_tag(message: Message, db: Database):
     target_display = await db.get_display_name(message.chat.id, target_id)
     await message.answer(phrases.TAG_SET.format(user=target_display, tag=tag_text))
 
-
 # --- Пользовательские РП-команды ---
 
 @router.message(F.text.startswith("+команда"))
 async def cmd_create_rp_command(message: Message, db: Database):
+    await try_delete_command_message(message)
     parts = message.text.split(maxsplit=2)
     if len(parts) < 3:
         return
@@ -76,6 +95,7 @@ async def cmd_create_rp_command(message: Message, db: Database):
 
 @router.message(Command("команды"))
 async def cmd_list_rp_commands(message: Message, db: Database):
+    await try_delete_command_message(message)
     commands = await db.get_all_rp_commands(message.chat.id)
     if not commands:
         await message.answer(phrases.COMMANDS_EMPTY)
@@ -87,6 +107,7 @@ async def cmd_list_rp_commands(message: Message, db: Database):
 
 @router.message(F.text.startswith("-команда"))
 async def cmd_delete_rp_command(message: Message, db: Database):
+    await try_delete_command_message(message)
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         return
@@ -100,60 +121,11 @@ async def cmd_delete_rp_command(message: Message, db: Database):
     await db.delete_rp_command(message.chat.id, cmd_name)
     await message.answer(phrases.COMMAND_DELETED.format(name=cmd_name))
 
-
-# --- Обработка РП-команд в чате ---
-
-@router.message()
-async def handle_custom_rp_and_activity(message: Message, db: Database, bot: Bot):
-    if not message.text or message.chat.type not in ["group", "supergroup"]:
-        return
-
-    # Авто-фиксация активности
-    if message.from_user and not message.from_user.is_bot:
-        await db.update_activity(
-            chat_id=message.chat.id,
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name
-        )
-
-    text = message.text.strip()
-    # Проверяем кастомные РП команды (например начинается с слова или +слово)
-    cmd_candidate = text.lstrip("+").split()[0].lower() if text else ""
-    rp_text_template = await db.get_rp_command(message.chat.id, cmd_candidate)
-    
-    if rp_text_template:
-        # Проверка на бота
-        target_user = None
-        if message.reply_to_message:
-            target_user = message.reply_to_message.from_user
-        
-        if target_user and target_user.id == bot.id:
-            await message.answer(phrases.ERR_BOT_TARGET)
-            return
-
-        sender_id = message.from_user.id
-        sender_name = await db.get_display_name(message.chat.id, sender_id)
-        
-        reply_name = ""
-        if message.reply_to_message and message.reply_to_message.from_user:
-            reply_name = await db.get_display_name(message.chat.id, message.reply_to_message.from_user.id)
-
-        random_user_id = await db.get_random_user(message.chat.id)
-        random_name = await db.get_display_name(message.chat.id, random_user_id) if random_user_id else "Кто-то"
-
-        formatted_text = rp_text_template \
-            .replace("{user}", sender_name).replace("{U}", sender_name) \
-            .replace("{reply}", reply_name).replace("{r}", reply_name) \
-            .replace("{random}", random_name).replace("{rn}", random_name)
-
-        await message.answer(formatted_text)
-
-
 # --- Активность (топ) ---
 
 @router.message(Command("актив"))
 async def cmd_active(message: Message, command: CommandObject, db: Database):
+    await try_delete_command_message(message)
     page = 1
     if command.args and command.args.isdigit():
         page = max(1, int(command.args))
@@ -175,20 +147,18 @@ async def cmd_active(message: Message, command: CommandObject, db: Database):
 
     await message.answer(text)
 
-
 # --- Модерация ---
 
 @router.message(Command("мут"))
 async def cmd_mute(message: Message, command: CommandObject, db: Database, bot: Bot):
+    await try_delete_command_message(message)
     level = await db.get_moderator_level(message.chat.id, message.from_user.id, get_creator_id())
     if level < 1:
         await message.answer(phrases.ERR_NO_PERMISSION)
         return
     
-    target_id = None
+    target_id = message.reply_to_message.from_user.id if message.reply_to_message and message.reply_to_message.from_user else None
     reason = command.args or "Нарушение"
-    if message.reply_to_message and message.reply_to_message.from_user:
-        target_id = message.reply_to_message.from_user.id
     
     if not target_id:
         await message.answer(phrases.ERR_USER_NOT_FOUND)
@@ -207,6 +177,7 @@ async def cmd_mute(message: Message, command: CommandObject, db: Database, bot: 
 
 @router.message(Command("размут"))
 async def cmd_unmute(message: Message, db: Database, bot: Bot):
+    await try_delete_command_message(message)
     level = await db.get_moderator_level(message.chat.id, message.from_user.id, get_creator_id())
     if level < 1:
         await message.answer(phrases.ERR_NO_PERMISSION)
@@ -218,7 +189,15 @@ async def cmd_unmute(message: Message, db: Database, bot: Bot):
         return
 
     try:
-        await bot.restrict_chat_member(message.chat.id, target_id, permissions=types.ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True))
+        await bot.restrict_chat_member(
+            message.chat.id, 
+            target_id, 
+            permissions=types.ChatPermissions(
+                can_send_messages=True, 
+                can_send_media_messages=True, 
+                can_send_other_messages=True
+            )
+        )
         target_name = await db.get_display_name(message.chat.id, target_id)
         await message.answer(phrases.UNMUTE_SUCCESS.format(user=target_name))
     except Exception as e:
@@ -226,6 +205,7 @@ async def cmd_unmute(message: Message, db: Database, bot: Bot):
 
 @router.message(Command("варн"))
 async def cmd_warn(message: Message, command: CommandObject, db: Database, bot: Bot):
+    await try_delete_command_message(message)
     level = await db.get_moderator_level(message.chat.id, message.from_user.id, get_creator_id())
     if level < 2:
         await message.answer(phrases.ERR_NO_PERMISSION)
@@ -252,6 +232,7 @@ async def cmd_warn(message: Message, command: CommandObject, db: Database, bot: 
 
 @router.message(Command("бан"))
 async def cmd_ban(message: Message, command: CommandObject, db: Database, bot: Bot):
+    await try_delete_command_message(message)
     level = await db.get_moderator_level(message.chat.id, message.from_user.id, get_creator_id())
     if level < 2:
         await message.answer(phrases.ERR_NO_PERMISSION)
@@ -273,6 +254,7 @@ async def cmd_ban(message: Message, command: CommandObject, db: Database, bot: B
 
 @router.message(Command("снять"))
 async def cmd_unwarn(message: Message, command: CommandObject, db: Database):
+    await try_delete_command_message(message)
     level = await db.get_moderator_level(message.chat.id, message.from_user.id, get_creator_id())
     if level < 2:
         await message.answer(phrases.ERR_NO_PERMISSION)
@@ -290,6 +272,7 @@ async def cmd_unwarn(message: Message, command: CommandObject, db: Database):
 
 @router.message(Command("модер"))
 async def cmd_moder(message: Message, command: CommandObject, db: Database):
+    await try_delete_command_message(message)
     level = await db.get_moderator_level(message.chat.id, message.from_user.id, get_creator_id())
     if level < 3:
         await message.answer(phrases.ERR_NO_PERMISSION)
@@ -311,6 +294,7 @@ async def cmd_moder(message: Message, command: CommandObject, db: Database):
 
 @router.message(Command("save"))
 async def cmd_save(message: Message, db: Database, bot: Bot):
+    await try_delete_command_message(message)
     storage_id = get_storage_chat_id()
     creator_id = get_creator_id()
     level = await db.get_moderator_level(message.chat.id, message.from_user.id, creator_id)
@@ -328,5 +312,61 @@ async def cmd_save(message: Message, db: Database, bot: Bot):
         chat_id=storage_id,
         document=FSInputFile("database.db"),
         caption=phrases.BACKUP_SUCCESS
-  )
-  
+    )
+
+# --- Обработчик обычных сообщений и кастомных РП-команд ---
+
+@router.message()
+async def handle_custom_rp_and_activity(message: Message, db: Database, bot: Bot):
+    if not message.text or message.chat.type not in ["group", "supergroup"]:
+        return
+
+    raw_text = message.text.strip()
+
+    # Игнорируем стандартные команды с / или системные ключевые слова (команды не засчитываем в актив)
+    if raw_text.startswith("/") or raw_text.startswith("+ник") or raw_text.startswith("-ник") or raw_text.startswith("тэг") or raw_text.startswith("+команда") or raw_text.startswith("-команда"):
+        return
+
+    # Проверяем, является ли сообщение пользовательской РП-командой
+    cmd_candidate = raw_text.lstrip("+").split()[0].lower()
+    rp_text_template = await db.get_rp_command(message.chat.id, cmd_candidate)
+
+    if rp_text_template:
+        # Утилизируем исходный текст РП-команды
+        await try_delete_command_message(message)
+
+        target_user = None
+        if message.reply_to_message:
+            target_user = message.reply_to_message.from_user
+
+        if target_user and target_user.id == bot.id:
+            await message.answer(phrases.ERR_BOT_TARGET)
+            return
+
+        sender_id = message.from_user.id
+        sender_name = await db.get_display_name(message.chat.id, sender_id)
+
+        reply_name = ""
+        if message.reply_to_message and message.reply_to_message.from_user:
+            reply_name = await db.get_display_name(message.chat.id, message.reply_to_message.from_user.id)
+
+        random_user_id = await db.get_random_user(message.chat.id)
+        random_name = await db.get_display_name(message.chat.id, random_user_id) if random_user_id else "Кто-то"
+
+        formatted_text = rp_text_template \
+            .replace("{user}", sender_name).replace("{U}", sender_name) \
+            .replace("{reply}", reply_name).replace("{r}", reply_name) \
+            .replace("{random}", random_name).replace("{rn}", random_name)
+
+        await message.answer(formatted_text)
+        return
+
+    # Если это обычное текстовое сообщение в чате (не команда) — обновляем счетчик активности
+    if message.from_user and not message.from_user.is_bot:
+        await db.update_activity(
+            chat_id=message.chat.id,
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name
+        )
+        
