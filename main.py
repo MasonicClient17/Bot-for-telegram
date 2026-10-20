@@ -14,9 +14,9 @@ import phrases
 load_dotenv()
 
 bot_token = os.getenv("BOT_TOKEN")
-if not database_token := bot_token:
+if not bot_token:
     raise ValueError("BOT_TOKEN не задан в переменных окружения!")
-
+    
 bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 db = Database(DB_NAME)
