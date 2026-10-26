@@ -94,8 +94,41 @@ async def answer_long(message: Message, text: str):
         await message.answer(chunk)
 
 
-async def prepare_target(message: Message, db: Database, bot: Bot, min_level: int, hierarchy: bool = True):
-    """Проверяет права и цель. При проблеме сам отвечает и возвращает None."""
+async def resolve_target(message: Message, command: CommandObject, db: Database, bot: Bot):
+    """Цель команды: ответ на сообщение ИЛИ упоминание в конце (@username / тап по имени).
+    Возвращает (User | None, args без упоминания)."""
+    args = (command.args or "").strip()
+
+    reply_user = get_reply_user(message)
+    if reply_user:
+        return reply_user, args
+
+    # Упоминание без username (text_mention) в самом конце
+    for ent in reversed(message.entities or []):
+        if ent.type == "text_mention" and ent.user:
+            mention_text = ent.extract_from(message.text)
+            if args.endswith(mention_text):
+                return ent.user, args[: -len(mention_text)].strip()
+            break
+
+    # @username в конце
+    tokens = args.rsplit(maxsplit=1)
+    if tokens and tokens[-1].startswith("@") and len(tokens[-1]) > 1:
+        rest = tokens[0] if len(tokens) == 2 else ""
+        user_id = await db.get_user_id_by_username(message.chat.id, tokens[-1])
+        if user_id:
+            try:
+                member = await bot.get_chat_member(message.chat.id, user_id)
+                return member.user, rest
+            except Exception as e:
+                logging.debug("get_chat_member не удался: %s", e)
+    return None, args
+
+
+async def prepare_target(message: Message, command: CommandObject, db: Database, bot: Bot,
+                         min_level: int, hierarchy: bool = True):
+    """Проверяет права и цель. При проблеме сам отвечает и возвращает None.
+    При успехе возвращает (target, args)."""
     if not is_group(message):
         await message.answer(phrases.ERR_GROUP_ONLY)
         return None
@@ -104,7 +137,7 @@ async def prepare_target(message: Message, db: Database, bot: Bot, min_level: in
     if my_level < min_level:
         await message.answer(phrases.ERR_NO_PERMISSION)
         return None
-    target = get_reply_user(message)
+    target, args = await resolve_target(message, command, db, bot)
     if not target:
         await message.answer(phrases.ERR_USER_NOT_FOUND)
         return None
@@ -114,7 +147,7 @@ async def prepare_target(message: Message, db: Database, bot: Bot, min_level: in
     if hierarchy and await level_of(db, chat_id, target.id) >= my_level:
         await message.answer(phrases.ERR_NO_PERMISSION)
         return None
-    return target
+    return target, args
 
 
 # ---------- публичные и системные команды ----------
@@ -295,10 +328,11 @@ def parse_mute_args(args: str | None):
 @router.message(Command("мут", ignore_case=True))
 async def cmd_mute(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    target = await prepare_target(message, db, bot, min_level=1)
-    if not target:
+    prepared = await prepare_target(message, command, db, bot, min_level=1)
+    if not prepared:
         return
-    until, duration_text, reason = parse_mute_args(command.args)
+    target, args = prepared
+    until, duration_text, reason = parse_mute_args(args)
     try:
         await bot.restrict_chat_member(
             message.chat.id, target.id,
@@ -314,11 +348,12 @@ async def cmd_mute(message: Message, command: CommandObject, db: Database, bot: 
 
 
 @router.message(Command("размут", ignore_case=True))
-async def cmd_unmute(message: Message, db: Database, bot: Bot):
+async def cmd_unmute(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    target = await prepare_target(message, db, bot, min_level=1, hierarchy=False)
-    if not target:
+    prepared = await prepare_target(message, command, db, bot, min_level=1, hierarchy=False)
+    if not prepared:
         return
+    target, _ = prepared
     try:
         # Всё, что не передано в restrict_chat_member, Telegram считает запрещённым —
         # поэтому возвращаем права по умолчанию самого чата.
@@ -340,11 +375,12 @@ async def cmd_unmute(message: Message, db: Database, bot: Bot):
 @router.message(Command("варн", ignore_case=True))
 async def cmd_warn(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    target = await prepare_target(message, db, bot, min_level=2)
-    if not target:
+    prepared = await prepare_target(message, command, db, bot, min_level=2)
+    if not prepared:
         return
+    target, args = prepared
     chat_id = message.chat.id
-    reason = command.args or "Без причины"
+    reason = args or "Без причины"
     warn_count = await db.add_warn(chat_id, target.id)
     name = await display(db, chat_id, target)
 
@@ -363,10 +399,11 @@ async def cmd_warn(message: Message, command: CommandObject, db: Database, bot: 
 @router.message(Command("бан", ignore_case=True))
 async def cmd_ban(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    target = await prepare_target(message, db, bot, min_level=2)
-    if not target:
+    prepared = await prepare_target(message, command, db, bot, min_level=2)
+    if not prepared:
         return
-    reason = command.args or "Нарушение"
+    target, args = prepared
+    reason = args or "Нарушение"
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
     except Exception as e:
@@ -379,12 +416,13 @@ async def cmd_ban(message: Message, command: CommandObject, db: Database, bot: B
 @router.message(Command("снять", ignore_case=True))
 async def cmd_unwarn(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    target = await prepare_target(message, db, bot, min_level=2, hierarchy=False)
-    if not target:
+    prepared = await prepare_target(message, command, db, bot, min_level=2, hierarchy=False)
+    if not prepared:
         return
+    target, args = prepared
     amount = 1
-    if command.args and command.args.strip().isdigit():
-        amount = min(max(1, int(command.args.strip())), 3)
+    if args.isdigit():
+        amount = min(max(1, int(args)), 3)
     new_total = await db.decrease_warn(message.chat.id, target.id, amount)
     name = await display(db, message.chat.id, target)
     await message.answer(phrases.UNWARN_SUCCESS.format(user=name, count=amount, total=new_total))
@@ -393,11 +431,12 @@ async def cmd_unwarn(message: Message, command: CommandObject, db: Database, bot
 @router.message(Command("модер", ignore_case=True))
 async def cmd_moder(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    target = await prepare_target(message, db, bot, min_level=3)
-    if not target:
+    prepared = await prepare_target(message, command, db, bot, min_level=3)
+    if not prepared:
         return
+    target, args = prepared
     chat_id = message.chat.id
-    arg = (command.args or "").split()
+    arg = args.split()
     if not arg or not arg[0].isdigit():
         await message.answer(phrases.USAGE_MODER.format(max=MAX_MOD_LEVEL))
         return
@@ -480,5 +519,5 @@ async def handle_custom_rp_and_activity(message: Message, db: Database, bot: Bot
             user_id=message.from_user.id,
             username=message.from_user.username,
             first_name=message.from_user.first_name,
-)
+    )
         
