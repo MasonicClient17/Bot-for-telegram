@@ -3,6 +3,7 @@ import logging
 import os
 
 from aiogram import Bot, Dispatcher
+from aiohttp import ClientSession, ClientTimeout, web
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
@@ -39,6 +40,32 @@ async def periodic_backup(hours: float):
         await backup_to_storage(phrases.PERIODIC_BACKUP_CAPTION)
 
 
+async def start_health_server():
+    """Мини-сайт «я жив»: Render требует, чтобы Web Service слушал порт $PORT."""
+    port = int(os.getenv("PORT", "0") or 0)
+    if not port:
+        return None
+    app = web.Application()
+    app.router.add_get("/", lambda request: web.Response(text="ok"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logging.info("Health-сервер запущен на порту %s", port)
+    return runner
+
+
+async def self_ping(url: str, interval_seconds: int = 600):
+    """Раз в 10 минут стучится на свой публичный адрес, чтобы Render не усыплял сервис."""
+    async with ClientSession(timeout=ClientTimeout(total=20)) as session:
+        while True:
+            await asyncio.sleep(interval_seconds)
+            try:
+                async with session.get(url) as resp:
+                    logging.debug("Self-ping %s -> %s", url, resp.status)
+            except Exception as e:
+                logging.warning("Self-ping не удался: %s", e)
+
+
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -63,6 +90,11 @@ async def main():
     if storage_id and interval > 0:
         backup_task = asyncio.create_task(periodic_backup(interval))
 
+    # На Render адрес сервиса лежит в RENDER_EXTERNAL_URL; для другого хоста можно задать SELF_PING_URL
+    health_runner = await start_health_server()
+    ping_url = os.getenv("SELF_PING_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    ping_task = asyncio.create_task(self_ping(ping_url)) if (health_runner and ping_url) else None
+
     logging.info("Бот запущен и готов к работе.")
     try:
         # aiogram сам ставит обработчики SIGTERM/SIGINT и корректно завершает polling
@@ -71,6 +103,10 @@ async def main():
     finally:
         if backup_task:
             backup_task.cancel()
+        if ping_task:
+            ping_task.cancel()
+        if health_runner:
+            await health_runner.cleanup()
         logging.info("Polling остановлен. Создаём финальный бэкап...")
         try:
             await asyncio.wait_for(backup_to_storage(phrases.SHUTDOWN_BACKUP_CAPTION), timeout=25)
@@ -86,3 +122,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logging.info("Бот остановлен.")
+        
