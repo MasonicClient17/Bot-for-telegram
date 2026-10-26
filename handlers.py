@@ -242,7 +242,7 @@ async def cmd_create_rp_command(message: Message, db: Database):
         await message.answer(phrases.ERR_TOO_LONG.format(limit=MAX_RP_TEXT_LEN))
         return
 
-    if not await db.add_rp_command(message.chat.id, cmd_name, cmd_text):
+    if not await db.add_rp_command(message.chat.id, cmd_name, cmd_text, message.from_user.id):
         await message.answer(phrases.ERR_COMMAND_EXISTS)
         return
     await message.answer(phrases.COMMAND_CREATED.format(name=esc(cmd_name)))
@@ -264,17 +264,25 @@ async def cmd_list_rp_commands(message: Message, db: Database):
 @router.message(kw("-команда"))
 async def cmd_delete_rp_command(message: Message, db: Database):
     await try_delete_command_message(message)
-    if await level_of(db, message.chat.id, message.from_user.id) < 2:
-        await message.answer(phrases.ERR_NO_PERMISSION)
-        return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await message.answer(phrases.USAGE_COMMAND_DELETE)
         return
+    chat_id = message.chat.id
     cmd_name = normalize_cmd_name(parts[1].split()[0])
-    if not await db.delete_rp_command(message.chat.id, cmd_name):
+
+    exists, author_id = await db.get_rp_command_info(chat_id, cmd_name)
+    if not exists:
         await message.answer(phrases.ERR_COMMAND_NOT_FOUND)
         return
+
+    # Свою команду может удалить автор, чужую (и старую, без автора) — модератор уровня 1+
+    is_author = author_id is not None and author_id == message.from_user.id
+    if not is_author and await level_of(db, chat_id, message.from_user.id) < 1:
+        await message.answer(phrases.ERR_NO_PERMISSION)
+        return
+
+    await db.delete_rp_command(chat_id, cmd_name)
     await message.answer(phrases.COMMAND_DELETED.format(name=esc(cmd_name)))
 
 
@@ -513,11 +521,4 @@ async def handle_custom_rp_and_activity(message: Message, db: Database, bot: Bot
         await message.answer(text)
         return
 
-    if not message.from_user.is_bot:
-        await db.update_activity(
-            chat_id=chat_id,
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-    )
-        
+    if not message.from_user.is
