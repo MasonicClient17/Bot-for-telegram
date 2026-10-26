@@ -521,4 +521,11 @@ async def handle_custom_rp_and_activity(message: Message, db: Database, bot: Bot
         await message.answer(text)
         return
 
-    if not message.from_user.is
+    if not message.from_user.is_bot:
+        await db.update_activity(
+            chat_id=chat_id,
+            user_id=message.from_user.id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+        )
+            
