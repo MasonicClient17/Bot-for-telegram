@@ -470,7 +470,8 @@ async def cmd_save(message: Message, db: Database, bot: Bot):
         await message.answer(phrases.ERR_NO_PERMISSION)
         return
     if not storage_id or message.chat.id != storage_id:
-        await message.answer(phrases.ERR_NOT_STORAGE_CHAT)
+        await message.answer(phrases.ERR_NOT_STORAGE_CHAT.format(
+            chat_id=message.chat.id, storage_id=storage_id or "не задан"))
         return
 
     try:
@@ -527,5 +528,5 @@ async def handle_custom_rp_and_activity(message: Message, db: Database, bot: Bot
             user_id=message.from_user.id,
             username=message.from_user.username,
             first_name=message.from_user.first_name,
-        )
-            
+                                       )
+        
