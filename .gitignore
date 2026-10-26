@@ -1,8 +1,11 @@
 __pycache__/
 *.py[cod]
-*$py.class
 .env
-database.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.restore
 .venv/
 venv/
 .idea/
