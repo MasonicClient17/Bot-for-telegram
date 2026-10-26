@@ -1,81 +1,88 @@
 import asyncio
 import logging
 import os
-import signal
-from aiogram import Bot, Dispatcher, types
-from aiogram.enums import ParseMode
+
+from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from dotenv import load_dotenv
+from aiogram.enums import ParseMode
 
-from db import Database, DB_NAME
-from handlers import router, get_storage_chat_id
 import phrases
-
-load_dotenv()
+from backup import restore_from_pinned, send_backup
+from config import DB_NAME, get_backup_interval_hours, get_storage_chat_id
+from db import Database
+from handlers import router
 
 bot_token = os.getenv("BOT_TOKEN")
 if not bot_token:
     raise ValueError("BOT_TOKEN не задан в переменных окружения!")
-    
+
 bot = Bot(token=bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 db = Database(DB_NAME)
 
-async def send_shutdown_backup():
+
+async def backup_to_storage(caption: str):
     storage_id = get_storage_chat_id()
-    if storage_id and os.path.exists(DB_NAME):
-        try:
-            await db.conn.commit()
-            await bot.send_document(
-                chat_id=storage_id,
-                document=types.FSInputFile(DB_NAME),
-                caption=phrases.SHUTDOWN_BACKUP_CAPTION
-            )
-            logging.info("Автобэкап базы данных успешно отправлен в STORAGE_CHAT_ID.")
-        except Exception as e:
-            logging.error(f"Не удалось отправить автобэкап при выключении: {e}")
+    if not storage_id:
+        logging.warning("STORAGE_CHAT_ID не задан — бэкап пропущен.")
+        return
+    try:
+        await send_backup(bot, db, storage_id, caption)
+        logging.info("Бэкап отправлен в STORAGE_CHAT_ID.")
+    except Exception:
+        logging.exception("Не удалось отправить бэкап в STORAGE_CHAT_ID")
+
+
+async def periodic_backup(hours: float):
+    while True:
+        await asyncio.sleep(hours * 3600)
+        await backup_to_storage(phrases.PERIODIC_BACKUP_CAPTION)
+
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    
+
+    # Файловая система Railway временная: если БД пропала (новый деплой без Volume),
+    # пробуем достать последний закреплённый бэкап из чата-хранилища.
+    storage_id = get_storage_chat_id()
+    if storage_id and not os.path.exists(DB_NAME):
+        try:
+            if await restore_from_pinned(bot, storage_id, DB_NAME):
+                logging.info("База восстановлена из закреплённого бэкапа.")
+        except Exception:
+            logging.exception("Не удалось восстановить базу из хранилища")
+
     await db.connect()
     await db.init_db()
 
     dp.include_router(router)
-    
-    # Передаем объект базы данных в контекст хэндлеров через middleware/workflow_data
-    dp['db'] = db
+    dp["db"] = db
 
-    # Настройка сигналов graceful shutdown для Railway / Docker (SIGTERM, SIGINT)
-    loop = asyncio.get_running_loop()
-    
-    def shutdown_handler():
-        logging.info("Получен сигнал завершения работы (SIGTERM/SIGINT). Создаем бэкап...")
-        asyncio.create_task(shutdown_sequence())
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, shutdown_handler)
-        except NotImplementedError:
-            # Windows не всегда поддерживает add_signal_handler для SIGTERM
-            pass
-
-    async def shutdown_sequence():
-        await send_shutdown_backup()
-        await db.close()
-        await bot.session.close()
-        logging.info("Бот успешно остановлен.")
-        loop.stop()
+    backup_task = None
+    interval = get_backup_interval_hours()
+    if storage_id and interval > 0:
+        backup_task = asyncio.create_task(periodic_backup(interval))
 
     logging.info("Бот запущен и готов к работе.")
     try:
-        await dp.start_polling(bot)
+        # aiogram сам ставит обработчики SIGTERM/SIGINT и корректно завершает polling
+        # (свои loop.add_signal_handler он всё равно перезаписывает). Бэкап делаем ПОСЛЕ.
+        await dp.start_polling(bot, close_bot_session=False)
     finally:
+        if backup_task:
+            backup_task.cancel()
+        logging.info("Polling остановлен. Создаём финальный бэкап...")
+        try:
+            await asyncio.wait_for(backup_to_storage(phrases.SHUTDOWN_BACKUP_CAPTION), timeout=25)
+        except asyncio.TimeoutError:
+            logging.error("Финальный бэкап не уложился в таймаут.")
         await db.close()
+        await bot.session.close()
+        logging.info("Бот успешно остановлен.")
+
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот принудительно остановлен пользователем.")
-    
+        logging.info("Бот остановлен.")
