@@ -64,9 +64,14 @@ class Database:
                 chat_id INTEGER,
                 name TEXT,
                 text TEXT,
+                author_id INTEGER,
                 PRIMARY KEY (chat_id, name)
             );
         """)
+        # Миграция для старых баз и старых бэкапов: колонки author_id может не быть
+        columns = [row[1] for row in await self._fetchall("PRAGMA table_info(rp_commands)")]
+        if "author_id" not in columns:
+            await self.conn.execute("ALTER TABLE rp_commands ADD COLUMN author_id INTEGER")
         await self.conn.commit()
 
     # --- бэкап ---
@@ -158,12 +163,18 @@ class Database:
 
     # --- РП-команды ---
 
-    async def add_rp_command(self, chat_id: int, name: str, text: str) -> bool:
+    async def add_rp_command(self, chat_id: int, name: str, text: str, author_id: int) -> bool:
         """False, если команда с таким именем уже есть."""
         rows = await self._exec(
-            "INSERT OR IGNORE INTO rp_commands (chat_id, name, text) VALUES (?, ?, ?)",
-            (chat_id, name.lower(), text))
+            "INSERT OR IGNORE INTO rp_commands (chat_id, name, text, author_id) VALUES (?, ?, ?, ?)",
+            (chat_id, name.lower(), text, author_id))
         return rows == 1
+
+    async def get_rp_command_info(self, chat_id: int, name: str):
+        """(существует, author_id). У команд, созданных до обновления, author_id = None."""
+        row = await self._fetchone(
+            "SELECT author_id FROM rp_commands WHERE chat_id = ? AND name = ?", (chat_id, name.lower()))
+        return (True, row[0]) if row else (False, None)
 
     async def get_rp_command(self, chat_id: int, name: str) -> str | None:
         row = await self._fetchone(
