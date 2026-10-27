@@ -57,3 +57,40 @@ COMMANDS_EMPTY = "📺В этом чате пока нет созданных Р
 BACKUP_SUCCESS = "💾 Ручной бэкап базы данных (/save)."
 SHUTDOWN_BACKUP_CAPTION = "🤖 Бот выключается. Автоматический бэкап базы данных."
 PERIODIC_BACKUP_CAPTION = "🕓 Плановый бэкап базы данных."
+
+# Недельная норма сообщений
+QUOTA_REPORT = (
+    "📋 <b>Недельная норма не выполнена</b>\n\n"
+    "Группа: {chat}\n"
+    "Участник: {user}\n"
+    "Сообщений за неделю: {count} из {quota}\n"
+    "Присоединился: {joined}"
+)
+QUOTA_FALLBACK_NOTE = "\n\n⚠️ Владелец группы не запускал бота, поэтому отчёт отправлен вам."
+QUOTA_TRUNCATED = "ℹ️ В «{chat}» ещё {n} участников не набрали норму (показаны первые {shown})."
+QUOTA_CONFIRM = "⚠️ <b>Вы уверены?</b>\n\nУчастник {user} будет заблокирован в группе «{chat}»."
+
+QUOTA_BTN_IGNORE = "🔵 IGNORE"
+QUOTA_BTN_WARN = "🟠 WARN"
+QUOTA_BTN_KICK = "🔴 KICK"
+QUOTA_BTN_ERROR404 = "🟣 ERROR404"
+QUOTA_BTN_YES = "🔴 YES"
+QUOTA_BTN_NO = "⚪ NO"
+
+QUOTA_ALREADY = "Этот отчёт уже обработан."
+QUOTA_DM_FAILED = "Резюме удалено, но личное предупреждение не доставлено: участник не запускал бота."
+QUOTA_RES_IGNORE = "🔵 Игнор: {user}. Участнику отправлено предупреждение."
+QUOTA_RES_WARN = "🟠 {user}: выдан варн на 7 дней ({total}/3)."
+QUOTA_RES_WARN_BAN = "🔴 {user} набрал 3 предупреждения и заблокирован в «{chat}»."
+QUOTA_RES_KICK = "🔴 {user} исключён из «{chat}» (может вернуться по ссылке)."
+QUOTA_RES_BAN = "⛔ {user} заблокирован в «{chat}»."
+QUOTA_ACTION_FAILED = "Не удалось: {error}"
+
+QUOTA_USER_IGNORED = (
+    "🔔 Вы не набрали недельную норму сообщений в группе «{chat}» ({count} из {quota}). "
+    "Пока без последствий, но будьте активнее!"
+)
+QUOTA_USER_WARNED = (
+    "⚠️ Вы получили предупреждение на 7 дней в группе «{chat}»: "
+    "за неделю {count} из {quota} сообщений."
+)

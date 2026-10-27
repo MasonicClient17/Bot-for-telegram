@@ -34,4 +34,18 @@ def get_backup_interval_hours() -> float:
         return float(os.getenv("BACKUP_INTERVAL_HOURS", "6"))
     except ValueError:
         return 6.0
-      
+
+
+def get_weekly_quota() -> int:
+    try:
+        return max(1, int(os.getenv("WEEKLY_QUOTA", "50")))
+    except ValueError:
+        return 50
+
+
+def get_quota_utc_offset() -> float:
+    """Сдвиг часового пояса относительно UTC для границы недели (понедельник 00:00)."""
+    try:
+        return float(os.getenv("QUOTA_UTC_OFFSET_HOURS", "0"))
+    except ValueError:
+        return 0.0

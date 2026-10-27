@@ -12,6 +12,7 @@ from backup import restore_from_pinned, send_backup
 from config import DB_NAME, get_backup_interval_hours, get_storage_chat_id
 from db import Database
 from handlers import router
+from quota import quota_router, weekly_loop
 
 bot_token = os.getenv("BOT_TOKEN")
 if not bot_token:
@@ -82,9 +83,11 @@ async def main():
     await db.connect()
     await db.init_db()
 
+    dp.include_router(quota_router)
     dp.include_router(router)
     dp["db"] = db
 
+    weekly_task = asyncio.create_task(weekly_loop(bot, db))
     backup_task = None
     interval = get_backup_interval_hours()
     if storage_id and interval > 0:
@@ -101,6 +104,7 @@ async def main():
         # (свои loop.add_signal_handler он всё равно перезаписывает). Бэкап делаем ПОСЛЕ.
         await dp.start_polling(bot, close_bot_session=False)
     finally:
+        weekly_task.cancel()
         if backup_task:
             backup_task.cancel()
         if ping_task:
@@ -122,4 +126,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logging.info("Бот остановлен.")
-        
