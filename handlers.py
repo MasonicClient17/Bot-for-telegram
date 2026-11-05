@@ -1,9 +1,13 @@
+import asyncio
 import html
 import logging
+import random
 import re
+import time
 from datetime import timedelta
 
 from aiogram import Router, F, Bot, types
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message
 
@@ -23,9 +27,17 @@ MAX_NAME_LEN = 32
 MAX_RP_TEXT_LEN = 1000
 MAX_TAG_LEN = 32
 
+# «калл» — общий сбор: каждый участник упоминается скрытой ссылкой-смайликом
+CALL_COOLDOWN_SECONDS = 120   # пауза между сборами в одном чате (модераторы 1+ без паузы)
+CALL_BATCH = 50               # упоминаний в одном сообщении (лимит Telegram — 100 на сообщение)
+MAX_CALL_MEMBERS = 500
+MAX_CALL_TEXT_LEN = 500
+CALL_EMOJIS = list("😀😎🤠🥳😺🐶🦊🐼🐸🐵🦁🐯🐰🐨🐙🦄🐝🦋🌸🌻🍀🌈⭐🔥💎🎈🎵🎲🚀🍕🍩🍉🍒🧩🎯🏆🌟💫🍄🐢🦉")
+_last_call: dict[int, float] = {}
+
 SYSTEM_COMMANDS = {
     "мут", "размут", "варн", "бан", "снять", "модер", "актив",
-    "ник", "тэг", "команда", "команды", "save", "start",
+    "ник", "тэг", "команда", "команды", "save", "start", "калл", "помощь",
 }
 
 COMMAND_NAME_RE = re.compile(r"[\w-]{1,32}")
@@ -57,6 +69,16 @@ def is_group(message: Message) -> bool:
     return message.chat.type in GROUP_TYPES
 
 
+def get_args(message: Message) -> str:
+    """Всё, что написано после первого слова (команды)."""
+    parts = (message.text or "").split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def is_number(value: str) -> bool:
+    return value.isascii() and value.isdigit()
+
+
 async def try_delete_command_message(message: Message):
     if is_group(message):
         try:
@@ -79,7 +101,8 @@ async def level_of(db: Database, chat_id: int, user_id: int) -> int:
 
 async def display(db: Database, chat_id: int, user: types.User) -> str:
     """Имя для вставки в сообщение: запоминает пользователя и экранирует HTML."""
-    await db.touch_user(chat_id, user.id, user.username, user.first_name)
+    if not user.is_bot:  # боты в статистику не попадают
+        await db.touch_user(chat_id, user.id, user.username, user.first_name)
     name = await db.get_display_name(chat_id, user.id, fallback=user.full_name)
     return esc(name)
 
@@ -126,7 +149,7 @@ async def resolve_target(message: Message, command: CommandObject, db: Database,
 
 
 async def prepare_target(message: Message, command: CommandObject, db: Database, bot: Bot,
-                         min_level: int, hierarchy: bool = True):
+                         min_level: int, hierarchy: bool = True, usage: str = ""):
     """Проверяет права и цель. При проблеме сам отвечает и возвращает None.
     При успехе возвращает (target, args)."""
     if not is_group(message):
@@ -139,7 +162,10 @@ async def prepare_target(message: Message, command: CommandObject, db: Database,
         return None
     target, args = await resolve_target(message, command, db, bot)
     if not target:
-        await message.answer(phrases.ERR_USER_NOT_FOUND)
+        text = phrases.ERR_USER_NOT_FOUND
+        if usage:
+            text += "\n" + phrases.USAGE_PREFIX.format(usage=esc(usage))
+        await message.answer(text)
         return None
     if target.id == bot.id:
         await message.answer(phrases.ERR_BOT_TARGET)
@@ -159,18 +185,20 @@ async def cmd_start(message: Message):
 
 
 # ---------- РП-ники и тэги ----------
+# Правило для команд без «/»: сообщение удаляется, только когда команда ВЫПОЛНЕНА.
+# Ошибка в слове — бот молчит. Ошибка в структуре — бот отвечает пояснением и ничего не удаляет
+# (вдруг это обычная фраза, например «актив сегодня слабый»).
 
 @router.message(kw("+ник"))
 async def cmd_set_rp_name(message: Message, db: Database):
-    await try_delete_command_message(message)
-    parts = message.text.split(maxsplit=1)
-    name = " ".join(parts[1].split()) if len(parts) > 1 else ""
+    name = " ".join(get_args(message).split())
     if not name:
-        await message.answer(phrases.USAGE_NICK)
+        await message.reply(phrases.USAGE_NICK)
         return
     if len(name) > MAX_NAME_LEN:
-        await message.answer(phrases.ERR_TOO_LONG.format(limit=MAX_NAME_LEN))
+        await message.reply(phrases.ERR_TOO_LONG.format(limit=MAX_NAME_LEN))
         return
+    await try_delete_command_message(message)
     await db.set_rp_name(message.chat.id, message.from_user.id, name)
     await message.answer(phrases.RP_NAME_SET.format(name=esc(name)))
 
@@ -178,6 +206,9 @@ async def cmd_set_rp_name(message: Message, db: Database):
 @router.message(Command("ник", ignore_case=True))
 @router.message(kw("-ник"))
 async def cmd_reset_rp_name(message: Message, db: Database):
+    if get_args(message):
+        await message.reply(phrases.USAGE_NICK_RESET)
+        return
     await try_delete_command_message(message)
     await db.set_rp_name(message.chat.id, message.from_user.id, "")
     await message.answer(phrases.RP_NAME_RESET)
@@ -185,36 +216,36 @@ async def cmd_reset_rp_name(message: Message, db: Database):
 
 @router.message(kw("тэг"))
 async def cmd_set_tag(message: Message, db: Database):
-    await try_delete_command_message(message)
     chat_id = message.chat.id
     if await level_of(db, chat_id, message.from_user.id) < TAG_MIN_LEVEL:
-        await message.answer(phrases.ERR_NO_PERMISSION)
+        await message.reply(phrases.ERR_NO_PERMISSION)
         return
 
+    args = get_args(message)
     reply_user = get_reply_user(message)
     if reply_user:
-        parts = message.text.split(maxsplit=1)
-        tag_text = " ".join(parts[1].split()) if len(parts) > 1 else ""
-        target_id = reply_user.id
-        await db.touch_user(chat_id, reply_user.id, reply_user.username, reply_user.first_name)
+        tag_text, target_id = " ".join(args.split()), reply_user.id
     else:
-        parts = message.text.split(maxsplit=2)
-        if len(parts) < 3:
-            await message.answer(phrases.USAGE_TAG)
+        parts = args.split(maxsplit=1)
+        if len(parts) < 2 or not parts[0].startswith("@") or len(parts[0]) < 2:
+            await message.reply(phrases.USAGE_TAG)
             return
-        tag_text = " ".join(parts[2].split())
-        target_id = await db.get_user_id_by_username(chat_id, parts[1])
+        tag_text = " ".join(parts[1].split())
+        target_id = await db.get_user_id_by_username(chat_id, parts[0])
         if not target_id:
-            await message.answer(phrases.ERR_USER_NOT_FOUND)
+            await message.reply(phrases.ERR_USER_NOT_FOUND)
             return
 
     if not tag_text:
-        await message.answer(phrases.USAGE_TAG)
+        await message.reply(phrases.USAGE_TAG)
         return
     if len(tag_text) > MAX_TAG_LEN:
-        await message.answer(phrases.ERR_TOO_LONG.format(limit=MAX_TAG_LEN))
+        await message.reply(phrases.ERR_TOO_LONG.format(limit=MAX_TAG_LEN))
         return
 
+    if reply_user and not reply_user.is_bot:
+        await db.touch_user(chat_id, reply_user.id, reply_user.username, reply_user.first_name)
+    await try_delete_command_message(message)
     await db.set_tag(chat_id, target_id, tag_text)
     target_display = esc(await db.get_display_name(chat_id, target_id))
     await message.answer(phrases.TAG_SET.format(user=target_display, tag=esc(tag_text)))
@@ -224,32 +255,36 @@ async def cmd_set_tag(message: Message, db: Database):
 
 @router.message(kw("+команда"))
 async def cmd_create_rp_command(message: Message, db: Database):
-    await try_delete_command_message(message)
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3 or not parts[2].strip():
-        await message.answer(phrases.USAGE_COMMAND_CREATE)
+    parts = get_args(message).split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await message.reply(phrases.USAGE_COMMAND_CREATE)
         return
-    cmd_name = normalize_cmd_name(parts[1])
-    cmd_text = parts[2].strip()
+    cmd_name = normalize_cmd_name(parts[0])
+    cmd_text = parts[1].strip()
 
     if not COMMAND_NAME_RE.fullmatch(cmd_name):
-        await message.answer(phrases.ERR_BAD_COMMAND_NAME)
+        await message.reply(phrases.ERR_BAD_COMMAND_NAME)
         return
     if cmd_name in SYSTEM_COMMANDS:
-        await message.answer(phrases.ERR_SYSTEM_COMMAND)
+        await message.reply(phrases.ERR_SYSTEM_COMMAND)
         return
     if len(cmd_text) > MAX_RP_TEXT_LEN:
-        await message.answer(phrases.ERR_TOO_LONG.format(limit=MAX_RP_TEXT_LEN))
+        await message.reply(phrases.ERR_TOO_LONG.format(limit=MAX_RP_TEXT_LEN))
         return
 
     if not await db.add_rp_command(message.chat.id, cmd_name, cmd_text, message.from_user.id):
-        await message.answer(phrases.ERR_COMMAND_EXISTS)
+        await message.reply(phrases.ERR_COMMAND_EXISTS)
         return
+    await try_delete_command_message(message)
     await message.answer(phrases.COMMAND_CREATED.format(name=esc(cmd_name)))
 
 
 @router.message(Command("команды", ignore_case=True))
+@router.message(kw("команды"))
 async def cmd_list_rp_commands(message: Message, db: Database):
+    if get_args(message):
+        await message.reply(phrases.USAGE_COMMANDS)
+        return
     await try_delete_command_message(message)
     commands = await db.get_all_rp_commands(message.chat.id)
     if not commands:
@@ -263,33 +298,38 @@ async def cmd_list_rp_commands(message: Message, db: Database):
 
 @router.message(kw("-команда"))
 async def cmd_delete_rp_command(message: Message, db: Database):
-    await try_delete_command_message(message)
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip():
-        await message.answer(phrases.USAGE_COMMAND_DELETE)
+    parts = get_args(message).split()
+    if len(parts) != 1:
+        await message.reply(phrases.USAGE_COMMAND_DELETE)
         return
     chat_id = message.chat.id
-    cmd_name = normalize_cmd_name(parts[1].split()[0])
+    cmd_name = normalize_cmd_name(parts[0])
 
     exists, author_id = await db.get_rp_command_info(chat_id, cmd_name)
     if not exists:
-        await message.answer(phrases.ERR_COMMAND_NOT_FOUND)
+        await message.reply(phrases.ERR_COMMAND_NOT_FOUND)
         return
 
     # Свою команду может удалить автор, чужую (и старую, без автора) — модератор уровня 1+
     is_author = author_id is not None and author_id == message.from_user.id
     if not is_author and await level_of(db, chat_id, message.from_user.id) < 1:
-        await message.answer(phrases.ERR_NO_PERMISSION)
+        await message.reply(phrases.ERR_NO_PERMISSION)
         return
 
+    await try_delete_command_message(message)
     await db.delete_rp_command(chat_id, cmd_name)
     await message.answer(phrases.COMMAND_DELETED.format(name=esc(cmd_name)))
 
 
-# ---------- активность ----------
+# ---------- активность и справка ----------
 
 @router.message(Command("актив", ignore_case=True))
-async def cmd_active(message: Message, command: CommandObject, db: Database):
+@router.message(kw("актив"))
+async def cmd_active(message: Message, db: Database):
+    parts = get_args(message).split()
+    if len(parts) > 1 or (parts and not is_number(parts[0])):
+        await message.reply(phrases.USAGE_ACTIVE)
+        return
     await try_delete_command_message(message)
     chat_id = message.chat.id
     total_users = await db.get_total_users_count(chat_id)
@@ -299,9 +339,7 @@ async def cmd_active(message: Message, command: CommandObject, db: Database):
 
     limit = 20
     total_pages = (total_users + limit - 1) // limit
-    page = 1
-    if command.args and command.args.strip().isdigit():
-        page = int(command.args.strip())
+    page = int(parts[0]) if parts else 1
     page = min(max(1, page), total_pages)
     offset = (page - 1) * limit
 
@@ -311,6 +349,16 @@ async def cmd_active(message: Message, command: CommandObject, db: Database):
         name = esc(await db.get_display_name(chat_id, user_id))
         text += phrases.ACTIVITY_LINE.format(index=idx, name=name, count=count)
     await message.answer(text)
+
+
+@router.message(Command("помощь", ignore_case=True))
+@router.message(kw("помощь"))
+async def cmd_help(message: Message):
+    if get_args(message):
+        await message.reply(phrases.USAGE_HELP)
+        return
+    await try_delete_command_message(message)
+    await message.answer(phrases.HELP_TEXT)
 
 
 # ---------- модерация ----------
@@ -336,7 +384,7 @@ def parse_mute_args(args: str | None):
 @router.message(Command("мут", ignore_case=True))
 async def cmd_mute(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=1)
+    prepared = await prepare_target(message, command, db, bot, min_level=1, usage=phrases.USAGE_MUTE)
     if not prepared:
         return
     target, args = prepared
@@ -358,7 +406,8 @@ async def cmd_mute(message: Message, command: CommandObject, db: Database, bot: 
 @router.message(Command("размут", ignore_case=True))
 async def cmd_unmute(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=1, hierarchy=False)
+    prepared = await prepare_target(message, command, db, bot, min_level=1, hierarchy=False,
+                                    usage=phrases.USAGE_UNMUTE)
     if not prepared:
         return
     target, _ = prepared
@@ -383,7 +432,7 @@ async def cmd_unmute(message: Message, command: CommandObject, db: Database, bot
 @router.message(Command("варн", ignore_case=True))
 async def cmd_warn(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=2)
+    prepared = await prepare_target(message, command, db, bot, min_level=2, usage=phrases.USAGE_WARN)
     if not prepared:
         return
     target, args = prepared
@@ -407,7 +456,7 @@ async def cmd_warn(message: Message, command: CommandObject, db: Database, bot: 
 @router.message(Command("бан", ignore_case=True))
 async def cmd_ban(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=2)
+    prepared = await prepare_target(message, command, db, bot, min_level=2, usage=phrases.USAGE_BAN)
     if not prepared:
         return
     target, args = prepared
@@ -424,12 +473,13 @@ async def cmd_ban(message: Message, command: CommandObject, db: Database, bot: B
 @router.message(Command("снять", ignore_case=True))
 async def cmd_unwarn(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=2, hierarchy=False)
+    prepared = await prepare_target(message, command, db, bot, min_level=2, hierarchy=False,
+                                    usage=phrases.USAGE_UNWARN)
     if not prepared:
         return
     target, args = prepared
     amount = 1
-    if args.isdigit():
+    if is_number(args):
         amount = min(max(1, int(args)), 3)
     new_total = await db.decrease_warn(message.chat.id, target.id, amount)
     name = await display(db, message.chat.id, target)
@@ -439,13 +489,14 @@ async def cmd_unwarn(message: Message, command: CommandObject, db: Database, bot
 @router.message(Command("модер", ignore_case=True))
 async def cmd_moder(message: Message, command: CommandObject, db: Database, bot: Bot):
     await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=3)
+    prepared = await prepare_target(message, command, db, bot, min_level=3,
+                                    usage=phrases.USAGE_MODER_LINE)
     if not prepared:
         return
     target, args = prepared
     chat_id = message.chat.id
     arg = args.split()
-    if not arg or not arg[0].isdigit():
+    if not arg or not is_number(arg[0]):
         await message.answer(phrases.USAGE_MODER.format(max=MAX_MOD_LEVEL))
         return
     new_level = int(arg[0])
@@ -479,6 +530,72 @@ async def cmd_save(message: Message, db: Database, bot: Bot):
     except Exception as e:
         logging.exception("Ошибка ручного бэкапа")
         await message.answer(phrases.ERR_BACKUP_FAILED.format(error=esc(e)))
+
+
+# ---------- общий сбор ----------
+
+@router.message(Command("калл", ignore_case=True))
+@router.message(kw("калл"))
+async def cmd_call_everyone(message: Message, db: Database, bot: Bot):
+    if not is_group(message):
+        await message.reply(phrases.ERR_GROUP_ONLY)
+        return
+    text = " ".join(get_args(message).split())
+    if not text:
+        await message.reply(phrases.USAGE_CALL)
+        return
+    if len(text) > MAX_CALL_TEXT_LEN:
+        await message.reply(phrases.ERR_TOO_LONG.format(limit=MAX_CALL_TEXT_LEN))
+        return
+
+    chat_id = message.chat.id
+    level = await level_of(db, chat_id, message.from_user.id)
+    wait = CALL_COOLDOWN_SECONDS - (time.monotonic() - _last_call.get(chat_id, -1e9))
+    if level < 1 and wait > 0:
+        await message.reply(phrases.ERR_CALL_COOLDOWN.format(
+            minutes=CALL_COOLDOWN_SECONDS // 60 or 1, seconds=int(wait) + 1))
+        return
+
+    member_ids = await db.get_member_ids(chat_id, message.from_user.id, MAX_CALL_MEMBERS)
+    try:  # админы, которых бот ещё ни разу не видел в чате
+        for admin in await bot.get_chat_administrators(chat_id):
+            u = admin.user
+            if not u.is_bot and u.id != message.from_user.id and u.id not in member_ids:
+                member_ids.append(u.id)
+    except Exception as e:
+        logging.debug("get_chat_administrators не удался: %s", e)
+    member_ids = member_ids[:MAX_CALL_MEMBERS]
+    if not member_ids:
+        await message.reply(phrases.ERR_CALL_NOBODY)
+        return
+
+    _last_call[chat_id] = time.monotonic()
+    await try_delete_command_message(message)
+    caller = await display(db, chat_id, message.from_user)
+    header = phrases.CALL_HEADER.format(user=caller, text=esc(text))
+
+    # Если «калл» написан ответом на сообщение — сбор тоже уходит ответом на него
+    replied = message.reply_to_message
+    reply_params = None
+    if replied and not replied.forum_topic_created:
+        reply_params = types.ReplyParameters(message_id=replied.message_id, allow_sending_without_reply=True)
+
+    for i in range(0, len(member_ids), CALL_BATCH):
+        mentions = "".join(
+            f'<a href="tg://user?id={uid}">{random.choice(CALL_EMOJIS)}</a>'
+            for uid in member_ids[i:i + CALL_BATCH])
+        body = f"{header}\n\n{mentions}" if i == 0 else mentions
+        extra = {"reply_parameters": reply_params} if (i == 0 and reply_params) else {}
+        try:
+            try:
+                await message.answer(body, **extra)
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                await message.answer(body, **extra)
+        except Exception:
+            logging.exception("Не удалось отправить пачку упоминаний")
+            break
+        await asyncio.sleep(1)  # лимит Telegram: ~20 сообщений в минуту на группу
 
 
 # ---------- РП-команды пользователей и подсчёт активности ----------
@@ -528,5 +645,4 @@ async def handle_custom_rp_and_activity(message: Message, db: Database, bot: Bot
             user_id=message.from_user.id,
             username=message.from_user.username,
             first_name=message.from_user.first_name,
-                                       )
-        
+        )

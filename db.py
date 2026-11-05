@@ -211,6 +211,16 @@ class Database:
         """, (chat_id,))
         return row[0] if row else None
 
+    async def get_member_ids(self, chat_id: int, exclude_user_id: int, limit: int) -> list[int]:
+        """Известные боту участники чата (самые активные первыми) — для команды «калл»."""
+        rows = await self._fetchall("""
+            SELECT user_id FROM member_stats
+            WHERE chat_id = ? AND user_id != ? AND COALESCE(is_member, 1) = 1
+            ORDER BY message_count DESC, user_id
+            LIMIT ?
+        """, (chat_id, exclude_user_id, limit))
+        return [r[0] for r in rows]
+
     # --- РП-команды ---
 
     async def add_rp_command(self, chat_id: int, name: str, text: str, author_id: int) -> bool:
