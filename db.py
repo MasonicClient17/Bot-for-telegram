@@ -5,7 +5,7 @@ import time
 
 import aiosqlite
 
-from config import CREATOR_LEVEL, DB_NAME
+from config import CREATOR_LEVEL, DB_NAME, LEVEL_OWNER
 
 
 def pick_display_name(rp_name, tag, first_name, username, fallback: str = "User") -> str:
@@ -129,7 +129,10 @@ class Database:
             "first_seen": "INTEGER",
             "is_member": "INTEGER DEFAULT 1",
             "reputation": "INTEGER DEFAULT 0",
+            "rest_until": "INTEGER",
         })
+        # Раньше уровней было 4, теперь 3: старый «4» становится «3»
+        await self._exec("UPDATE moderators SET level = ? WHERE level > ?", (LEVEL_OWNER, LEVEL_OWNER))
         await self._ensure_columns("temp_warns", {
             "issued_at": "INTEGER",
             "issued_by": "INTEGER",
@@ -272,6 +275,12 @@ class Database:
             "SELECT level FROM moderators WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         return row[0] if row else 0
 
+    async def get_stored_moderator_level(self, chat_id: int, user_id: int) -> int:
+        """Уровень из базы БЕЗ привилегий суперпользователя — для показа статуса в профиле."""
+        row = await self._fetchone(
+            "SELECT level FROM moderators WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        return row[0] if row else 0
+
     async def set_moderator_level(self, chat_id: int, user_id: int, level: int):
         await self._exec("""
             INSERT INTO moderators (chat_id, user_id, level) VALUES (?, ?, ?)
@@ -366,14 +375,16 @@ class Database:
         return [r[0] for r in rows]
 
     async def get_quota_candidates(self, chat_id: int, quota: int, grace_cutoff: int):
-        """Участники под нормой. Те, кто вступил/появился после grace_cutoff, пропускаются (льготная неделя)."""
+        """Участники под нормой. Пропускаются: вступившие после grace_cutoff (льготная неделя)
+        и те, кто сейчас на ресте."""
         return await self._fetchall_dict("""
             SELECT user_id, username, first_name, rp_name, week_count, joined_at, first_seen
             FROM member_stats
             WHERE chat_id = ? AND is_member = 1 AND COALESCE(week_count, 0) < ?
               AND COALESCE(joined_at, first_seen, 0) <= ?
+              AND COALESCE(rest_until, 0) <= ?
             ORDER BY week_count, user_id
-        """, (chat_id, quota, grace_cutoff))
+        """, (chat_id, quota, grace_cutoff, int(time.time())))
 
     async def reset_week_counts(self):
         await self._exec("UPDATE member_stats SET week_count = 0")
@@ -440,9 +451,26 @@ class Database:
     async def get_inactive_members(self, chat_id: int, quota: int, limit: int):
         """Участники, не набравшие норму за текущую неделю (меньше всех сообщений — первыми)."""
         return await self._fetchall_dict("""
-            SELECT user_id, rp_name, tag, first_name, username, COALESCE(week_count, 0) AS week_count
+            SELECT user_id, rp_name, tag, first_name, username, COALESCE(week_count, 0) AS week_count,
+                   COALESCE(rest_until, 0) AS rest_until
             FROM member_stats
             WHERE chat_id = ? AND COALESCE(is_member, 1) = 1 AND COALESCE(week_count, 0) < ?
             ORDER BY week_count, user_id
             LIMIT ?
         """, (chat_id, quota, limit))
+
+    # --- рест (отдых от нормы) ---
+
+    async def set_rest(self, chat_id: int, user_id: int, until: int):
+        await self._exec("""
+            INSERT INTO member_stats (chat_id, user_id, rest_until, first_seen) VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET rest_until = excluded.rest_until
+        """, (chat_id, user_id, until, int(time.time())))
+
+    async def clear_rest(self, chat_id: int, user_id: int) -> bool:
+        """True, если рест действительно действовал и был снят."""
+        rows = await self._exec("""
+            UPDATE member_stats SET rest_until = NULL
+            WHERE chat_id = ? AND user_id = ? AND COALESCE(rest_until, 0) > ?
+        """, (chat_id, user_id, int(time.time())))
+        return rows > 0

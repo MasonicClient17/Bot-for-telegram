@@ -13,10 +13,13 @@ from aiogram.types import Message
 
 import phrases
 from backup import send_backup
-from config import CREATOR_LEVEL, MAX_ACTIVE_WARNS, WARN_COOLDOWN_SECONDS, get_storage_chat_id
+from config import (
+    CREATOR_LEVEL, LEVEL_ADMIN, LEVEL_HELPER, LEVEL_OWNER, MAX_ACTIVE_WARNS, WARN_COOLDOWN_SECONDS,
+    get_storage_chat_id,
+)
 from db import Database
 from utils import (
-    answer_long, display, esc, format_datetime, get_args, is_group, is_number, kw, kw_phrase,
+    answer_long, display, esc, format_datetime, get_args, is_group, is_number, kw,
     level_of, prepare_target, try_delete_command_message, get_reply_user,
 )
 
@@ -24,8 +27,9 @@ router = Router()
 # Сообщения без отправителя (каналы и т.п.) обрабатывать не нужно
 router.message.filter(F.from_user)
 
-MAX_MOD_LEVEL = 4          # 1 — мут, 2 — варн/бан, 3 — назначение модеров, 4 — /save
-TAG_MIN_LEVEL = 1          # кто может ставить тэги (0 — все, как было раньше)
+MAX_MOD_LEVEL = LEVEL_OWNER  # уровни: 1 Хелпер, 2 Админ, 3 Владелец
+TAG_MIN_LEVEL = LEVEL_HELPER  # кто может ставить тэги (0 — все)
+SAVE_MIN_LEVEL = LEVEL_OWNER  # ручной бэкап /save
 MAX_NAME_LEN = 32
 MAX_RP_TEXT_LEN = 1000
 MAX_TAG_LEN = 32
@@ -39,8 +43,8 @@ CALL_EMOJIS = list("😀😎🤠🥳😺🐶🦊🐼🐸🐵🦁🐯🐰🐨🐙
 _last_call: dict[int, float] = {}
 
 SYSTEM_COMMANDS = {
-    "мут", "размут", "варн", "бан", "снять", "модер", "актив",
-    "ник", "тэг", "команда", "команды", "save", "start", "калл", "помощь",
+    "мут", "размут", "варн", "-варн", "бан", "модер", "актив", "рест", "-рест",
+    "ник", "-ник", "тэг", "команда", "-команда", "команды", "save", "start", "калл", "помощь",
     "кто", "норма", "неактив",
 }
 
@@ -94,9 +98,9 @@ async def cmd_reset_rp_name(message: Message, db: Database):
 
 
 @router.message(kw("тэг"))
-async def cmd_set_tag(message: Message, db: Database):
+async def cmd_set_tag(message: Message, db: Database, bot: Bot):
     chat_id = message.chat.id
-    if await level_of(db, chat_id, message.from_user.id) < TAG_MIN_LEVEL:
+    if await level_of(db, bot, chat_id, message.from_user.id) < TAG_MIN_LEVEL:
         await message.reply(phrases.ERR_NO_PERMISSION)
         return
 
@@ -176,7 +180,7 @@ async def cmd_list_rp_commands(message: Message, db: Database):
 
 
 @router.message(kw("-команда"))
-async def cmd_delete_rp_command(message: Message, db: Database):
+async def cmd_delete_rp_command(message: Message, db: Database, bot: Bot):
     parts = get_args(message).split()
     if len(parts) != 1:
         await message.reply(phrases.USAGE_COMMAND_DELETE)
@@ -191,7 +195,7 @@ async def cmd_delete_rp_command(message: Message, db: Database):
 
     # Свою команду может удалить автор, чужую (и старую, без автора) — модератор уровня 1+
     is_author = author_id is not None and author_id == message.from_user.id
-    if not is_author and await level_of(db, chat_id, message.from_user.id) < 1:
+    if not is_author and await level_of(db, bot, chat_id, message.from_user.id) < LEVEL_HELPER:
         await message.reply(phrases.ERR_NO_PERMISSION)
         return
 
@@ -286,7 +290,8 @@ def parse_warn_duration(token: str) -> timedelta | None:
 
 @router.message(Command("мут", ignore_case=True))
 async def cmd_mute(message: Message, db: Database, bot: Bot):
-    prepared = await prepare_target(message, get_args(message), db, bot, min_level=1, usage=phrases.USAGE_MUTE)
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=LEVEL_HELPER,
+                                    usage=phrases.USAGE_MUTE)
     if not prepared:
         return
     target, rest = prepared
@@ -308,7 +313,7 @@ async def cmd_mute(message: Message, db: Database, bot: Bot):
 
 @router.message(Command("размут", ignore_case=True))
 async def cmd_unmute(message: Message, db: Database, bot: Bot):
-    prepared = await prepare_target(message, get_args(message), db, bot, min_level=1, hierarchy=False,
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=LEVEL_HELPER, hierarchy=False,
                                     usage=phrases.USAGE_UNMUTE)
     if not prepared:
         return
@@ -336,7 +341,7 @@ async def cmd_unmute(message: Message, db: Database, bot: Bot):
 @router.message(kw("варн"))
 async def cmd_warn(message: Message, db: Database, bot: Bot):
     """варн [число][ч|д|н|м] [причина] [@username] — варн с истечением; 3-й активный варн = бан."""
-    prepared = await prepare_target(message, get_args(message), db, bot, min_level=2,
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=LEVEL_ADMIN,
                                     usage=phrases.USAGE_WARN_LINE)
     if not prepared:
         return
@@ -387,16 +392,11 @@ async def cmd_warn(message: Message, db: Database, bot: Bot):
         reason=phrases.WARN_REASON.format(reason=esc(reason)) if reason else ""))
 
 
-@router.message(Command("снять", ignore_case=True))
-@router.message(kw_phrase("снять", "варны"))
+@router.message(kw("-варн"))
 async def cmd_unwarn(message: Message, db: Database, bot: Bot):
-    """снять варны [число] [@username] — число по умолчанию 1."""
-    head, _, tail = get_args(message).partition(" ")
-    if head.casefold() != "варны":  # «/снять 2» без слова «варны» — ошибка структуры
-        await message.reply(phrases.USAGE_UNWARN)
-        return
-    prepared = await prepare_target(message, tail, db, bot, min_level=2, hierarchy=False,
-                                    usage=phrases.USAGE_UNWARN_LINE)
+    """-варн [число] [@username] — снимает варны (число по умолчанию 1)."""
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=LEVEL_ADMIN,
+                                    hierarchy=False, usage=phrases.USAGE_UNWARN_LINE)
     if not prepared:
         return
     target, rest = prepared
@@ -420,7 +420,7 @@ async def cmd_unwarn(message: Message, db: Database, bot: Bot):
 
 @router.message(Command("бан", ignore_case=True))
 async def cmd_ban(message: Message, db: Database, bot: Bot):
-    prepared = await prepare_target(message, get_args(message), db, bot, min_level=2, usage=phrases.USAGE_BAN)
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=LEVEL_ADMIN, usage=phrases.USAGE_BAN)
     if not prepared:
         return
     target, rest = prepared
@@ -437,7 +437,7 @@ async def cmd_ban(message: Message, db: Database, bot: Bot):
 
 @router.message(Command("модер", ignore_case=True))
 async def cmd_moder(message: Message, db: Database, bot: Bot):
-    prepared = await prepare_target(message, get_args(message), db, bot, min_level=3,
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=LEVEL_OWNER,
                                     usage=phrases.USAGE_MODER_LINE)
     if not prepared:
         return
@@ -448,7 +448,7 @@ async def cmd_moder(message: Message, db: Database, bot: Bot):
         await message.reply(phrases.USAGE_MODER.format(max=MAX_MOD_LEVEL))
         return
     new_level = int(tokens[0])
-    my_level = await level_of(db, chat_id, message.from_user.id)
+    my_level = await level_of(db, bot, chat_id, message.from_user.id)
     # Нельзя выдать уровень выше максимального и не ниже собственного (кроме создателя)
     if new_level > MAX_MOD_LEVEL or (new_level >= my_level and my_level != CREATOR_LEVEL):
         await message.reply(phrases.ERR_BAD_LEVEL)
@@ -466,7 +466,7 @@ async def cmd_save(message: Message, db: Database, bot: Bot):
     await try_delete_command_message(message)
     storage_id = get_storage_chat_id()
 
-    if await level_of(db, message.chat.id, message.from_user.id) < 4:
+    if await level_of(db, bot, message.chat.id, message.from_user.id) < SAVE_MIN_LEVEL:
         await message.answer(phrases.ERR_NO_PERMISSION)
         return
     if not storage_id or message.chat.id != storage_id:
@@ -498,9 +498,9 @@ async def cmd_call_everyone(message: Message, db: Database, bot: Bot):
         return
 
     chat_id = message.chat.id
-    level = await level_of(db, chat_id, message.from_user.id)
+    level = await level_of(db, bot, chat_id, message.from_user.id)
     wait = CALL_COOLDOWN_SECONDS - (time.monotonic() - _last_call.get(chat_id, -1e9))
-    if level < 1 and wait > 0:
+    if level < LEVEL_HELPER and wait > 0:
         await message.reply(phrases.ERR_CALL_COOLDOWN.format(
             minutes=CALL_COOLDOWN_SECONDS // 60 or 1, seconds=int(wait) + 1))
         return

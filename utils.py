@@ -1,13 +1,14 @@
 """Общие помощники для модулей с командами (handlers, profile, quota)."""
 import html
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, F, types
 from aiogram.types import Message
 
 import phrases
-from config import get_creator_id, get_quota_utc_offset, get_weekly_quota
+from config import LEVEL_OWNER, get_creator_id, get_quota_utc_offset, get_weekly_quota
 from db import Database
 
 GROUP_TYPES = {"group", "supergroup"}
@@ -78,8 +79,33 @@ def get_reply_user(message: Message) -> types.User | None:
     return reply.from_user
 
 
-async def level_of(db: Database, chat_id: int, user_id: int) -> int:
-    return await db.get_moderator_level(chat_id, user_id, get_creator_id())
+OWNER_CACHE_SECONDS = 600
+_owner_cache: dict[int, tuple[int | None, float]] = {}
+
+
+async def get_chat_owner_id(bot: Bot, chat_id: int) -> int | None:
+    """ID владельца группы в Telegram (кэшируется на 10 минут, чтобы не дёргать API на каждую команду)."""
+    if chat_id > 0:  # личный чат
+        return None
+    cached = _owner_cache.get(chat_id)
+    if cached and time.monotonic() - cached[1] < OWNER_CACHE_SECONDS:
+        return cached[0]
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+    except Exception as e:
+        logging.debug("get_chat_administrators(%s) не удался: %s", chat_id, e)
+        return cached[0] if cached else None
+    owner_id = next((a.user.id for a in admins if a.status == "creator"), None)
+    _owner_cache[chat_id] = (owner_id, time.monotonic())
+    return owner_id
+
+
+async def level_of(db: Database, bot: Bot, chat_id: int, user_id: int) -> int:
+    """Эффективный уровень: из базы (создатель бота — CREATOR_LEVEL) и не ниже LEVEL_OWNER у владельца группы."""
+    level = await db.get_moderator_level(chat_id, user_id, get_creator_id())
+    if level < LEVEL_OWNER and user_id == await get_chat_owner_id(bot, chat_id):
+        return LEVEL_OWNER
+    return level
 
 
 async def chat_quota(db: Database, chat_id: int) -> int:
@@ -156,7 +182,7 @@ async def prepare_target(message: Message, args: str, db: Database, bot: Bot,
         await message.reply(phrases.ERR_GROUP_ONLY)
         return None
     chat_id = message.chat.id
-    my_level = await level_of(db, chat_id, message.from_user.id)
+    my_level = await level_of(db, bot, chat_id, message.from_user.id)
     if my_level < min_level:
         await message.reply(phrases.ERR_NO_PERMISSION)
         return None
@@ -170,7 +196,7 @@ async def prepare_target(message: Message, args: str, db: Database, bot: Bot,
     if target.id == bot.id:
         await message.reply(phrases.ERR_BOT_TARGET)
         return None
-    if hierarchy and await level_of(db, chat_id, target.id) >= my_level:
+    if hierarchy and await level_of(db, bot, chat_id, target.id) >= my_level:
         await message.reply(phrases.ERR_NO_PERMISSION)
         return None
     return target, rest
