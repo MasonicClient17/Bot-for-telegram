@@ -49,3 +49,9 @@ def get_quota_utc_offset() -> float:
         return float(os.getenv("QUOTA_UTC_OFFSET_HOURS", "0"))
     except ValueError:
         return 0.0
+
+
+# --- общие константы ---
+CREATOR_LEVEL = 99          # уровень создателя бота (CREATOR_ID) — выше любого модератора
+MAX_ACTIVE_WARNS = 2        # столько варнов можно иметь одновременно; следующий (3-й) = бан
+WARN_COOLDOWN_SECONDS = 3600  # не чаще одного варна в час на пользователя

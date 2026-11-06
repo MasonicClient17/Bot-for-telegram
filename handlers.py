@@ -1,6 +1,6 @@
 import asyncio
-import html
 import logging
+import math
 import random
 import re
 import time
@@ -8,19 +8,22 @@ from datetime import timedelta
 
 from aiogram import Router, F, Bot, types
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiogram.types import Message
 
 import phrases
 from backup import send_backup
-from config import get_creator_id, get_storage_chat_id
+from config import CREATOR_LEVEL, MAX_ACTIVE_WARNS, WARN_COOLDOWN_SECONDS, get_storage_chat_id
 from db import Database
+from utils import (
+    answer_long, display, esc, format_datetime, get_args, is_group, is_number, kw, kw_phrase,
+    level_of, prepare_target, try_delete_command_message, get_reply_user,
+)
 
 router = Router()
 # Сообщения без отправителя (каналы и т.п.) обрабатывать не нужно
 router.message.filter(F.from_user)
 
-GROUP_TYPES = {"group", "supergroup"}
 MAX_MOD_LEVEL = 4          # 1 — мут, 2 — варн/бан, 3 — назначение модеров, 4 — /save
 TAG_MIN_LEVEL = 1          # кто может ставить тэги (0 — все, как было раньше)
 MAX_NAME_LEN = 32
@@ -38,6 +41,7 @@ _last_call: dict[int, float] = {}
 SYSTEM_COMMANDS = {
     "мут", "размут", "варн", "бан", "снять", "модер", "актив",
     "ник", "тэг", "команда", "команды", "save", "start", "калл", "помощь",
+    "кто", "норма", "неактив",
 }
 
 COMMAND_NAME_RE = re.compile(r"[\w-]{1,32}")
@@ -47,133 +51,8 @@ PLACEHOLDER_RE = re.compile(r"\{(user|U|reply|r|random|rn)\}")
 
 # ---------- помощники ----------
 
-def esc(value) -> str:
-    """Экранирование для ParseMode.HTML: имена и тексты пользователей нельзя вставлять как есть."""
-    return html.escape(str(value), quote=False)
-
-
-def kw(*words: str):
-    """Точное совпадение ПЕРВОГО слова сообщения (без учёта регистра)."""
-    wanted = {w.casefold() for w in words}
-
-    def check(message: Message) -> bool:
-        if not message.text:
-            return False
-        parts = message.text.split(maxsplit=1)
-        return bool(parts) and parts[0].casefold() in wanted
-
-    return F.func(check)
-
-
-def is_group(message: Message) -> bool:
-    return message.chat.type in GROUP_TYPES
-
-
-def get_args(message: Message) -> str:
-    """Всё, что написано после первого слова (команды)."""
-    parts = (message.text or "").split(maxsplit=1)
-    return parts[1].strip() if len(parts) > 1 else ""
-
-
-def is_number(value: str) -> bool:
-    return value.isascii() and value.isdigit()
-
-
-async def try_delete_command_message(message: Message):
-    if is_group(message):
-        try:
-            await message.delete()
-        except Exception as e:
-            logging.debug("Не удалось удалить сообщение с командой: %s", e)
-
-
-def get_reply_user(message: Message) -> types.User | None:
-    """Автор сообщения, на которое ответили (в форумах игнорируем корень топика)."""
-    reply = message.reply_to_message
-    if not reply or not reply.from_user or reply.forum_topic_created:
-        return None
-    return reply.from_user
-
-
-async def level_of(db: Database, chat_id: int, user_id: int) -> int:
-    return await db.get_moderator_level(chat_id, user_id, get_creator_id())
-
-
-async def display(db: Database, chat_id: int, user: types.User) -> str:
-    """Имя для вставки в сообщение: запоминает пользователя и экранирует HTML."""
-    if not user.is_bot:  # боты в статистику не попадают
-        await db.touch_user(chat_id, user.id, user.username, user.first_name)
-    name = await db.get_display_name(chat_id, user.id, fallback=user.full_name)
-    return esc(name)
-
-
 def normalize_cmd_name(raw: str) -> str:
     return raw.strip().lstrip("+").lower()
-
-
-async def answer_long(message: Message, text: str):
-    while text:
-        chunk, text = text[:4000], text[4000:]
-        await message.answer(chunk)
-
-
-async def resolve_target(message: Message, command: CommandObject, db: Database, bot: Bot):
-    """Цель команды: ответ на сообщение ИЛИ упоминание в конце (@username / тап по имени).
-    Возвращает (User | None, args без упоминания)."""
-    args = (command.args or "").strip()
-
-    reply_user = get_reply_user(message)
-    if reply_user:
-        return reply_user, args
-
-    # Упоминание без username (text_mention) в самом конце
-    for ent in reversed(message.entities or []):
-        if ent.type == "text_mention" and ent.user:
-            mention_text = ent.extract_from(message.text)
-            if args.endswith(mention_text):
-                return ent.user, args[: -len(mention_text)].strip()
-            break
-
-    # @username в конце
-    tokens = args.rsplit(maxsplit=1)
-    if tokens and tokens[-1].startswith("@") and len(tokens[-1]) > 1:
-        rest = tokens[0] if len(tokens) == 2 else ""
-        user_id = await db.get_user_id_by_username(message.chat.id, tokens[-1])
-        if user_id:
-            try:
-                member = await bot.get_chat_member(message.chat.id, user_id)
-                return member.user, rest
-            except Exception as e:
-                logging.debug("get_chat_member не удался: %s", e)
-    return None, args
-
-
-async def prepare_target(message: Message, command: CommandObject, db: Database, bot: Bot,
-                         min_level: int, hierarchy: bool = True, usage: str = ""):
-    """Проверяет права и цель. При проблеме сам отвечает и возвращает None.
-    При успехе возвращает (target, args)."""
-    if not is_group(message):
-        await message.answer(phrases.ERR_GROUP_ONLY)
-        return None
-    chat_id = message.chat.id
-    my_level = await level_of(db, chat_id, message.from_user.id)
-    if my_level < min_level:
-        await message.answer(phrases.ERR_NO_PERMISSION)
-        return None
-    target, args = await resolve_target(message, command, db, bot)
-    if not target:
-        text = phrases.ERR_USER_NOT_FOUND
-        if usage:
-            text += "\n" + phrases.USAGE_PREFIX.format(usage=esc(usage))
-        await message.answer(text)
-        return None
-    if target.id == bot.id:
-        await message.answer(phrases.ERR_BOT_TARGET)
-        return None
-    if hierarchy and await level_of(db, chat_id, target.id) >= my_level:
-        await message.answer(phrases.ERR_NO_PERMISSION)
-        return None
-    return target, args
 
 
 # ---------- публичные и системные команды ----------
@@ -362,9 +241,22 @@ async def cmd_help(message: Message):
 
 
 # ---------- модерация ----------
+# Сообщение с командой удаляется только после успешного выполнения; при ошибке бот отвечает на него.
+
+WARN_DURATION_RE = re.compile(r"([0-9]{1,4})([чднм])", re.IGNORECASE)
+WARN_UNITS = {
+    "ч": timedelta(hours=1),
+    "д": timedelta(days=1),
+    "н": timedelta(weeks=1),
+    "м": timedelta(days=30),      # месяц = 30 дней
+}
+MAX_WARN_DURATION = timedelta(days=365)
+MAX_REASON_LEN = 200
+
 
 def parse_mute_args(args: str | None):
-    """'10м причина' -> (timedelta(minutes=10), '10м', 'причина'); без срока — навсегда."""
+    """'10м причина' -> (timedelta(minutes=10), '10м', 'причина'); без срока — навсегда.
+    Внимание: в муте «м» — минуты (в варне «м» — месяцы)."""
     if not args:
         return None, "навсегда", "Нарушение"
     first, _, rest = args.strip().partition(" ")
@@ -381,14 +273,24 @@ def parse_mute_args(args: str | None):
     return delta, first, rest.strip() or "Нарушение"
 
 
+def parse_warn_duration(token: str) -> timedelta | None:
+    """'2д' -> 2 дня, '1н' -> неделя, '3м' -> 90 дней. Неверный формат или нулевой срок -> None."""
+    match = WARN_DURATION_RE.fullmatch(token)
+    if not match:
+        return None
+    value = int(match.group(1))
+    if value == 0:
+        return None
+    return WARN_UNITS[match.group(2).lower()] * value
+
+
 @router.message(Command("мут", ignore_case=True))
-async def cmd_mute(message: Message, command: CommandObject, db: Database, bot: Bot):
-    await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=1, usage=phrases.USAGE_MUTE)
+async def cmd_mute(message: Message, db: Database, bot: Bot):
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=1, usage=phrases.USAGE_MUTE)
     if not prepared:
         return
-    target, args = prepared
-    until, duration_text, reason = parse_mute_args(args)
+    target, rest = prepared
+    until, duration_text, reason = parse_mute_args(rest)
     try:
         await bot.restrict_chat_member(
             message.chat.id, target.id,
@@ -396,17 +298,17 @@ async def cmd_mute(message: Message, command: CommandObject, db: Database, bot: 
             until_date=until,
         )
     except Exception as e:
-        await message.answer(phrases.ERR_ACTION_FAILED.format(error=esc(e)))
+        await message.reply(phrases.ERR_ACTION_FAILED.format(error=esc(e)))
         return
+    await try_delete_command_message(message)
     name = await display(db, message.chat.id, target)
     await message.answer(phrases.MUTE_SUCCESS.format(
         user=name, duration=esc(duration_text), reason=esc(reason)))
 
 
 @router.message(Command("размут", ignore_case=True))
-async def cmd_unmute(message: Message, command: CommandObject, db: Database, bot: Bot):
-    await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=1, hierarchy=False,
+async def cmd_unmute(message: Message, db: Database, bot: Bot):
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=1, hierarchy=False,
                                     usage=phrases.USAGE_UNMUTE)
     if not prepared:
         return
@@ -423,89 +325,136 @@ async def cmd_unmute(message: Message, command: CommandObject, db: Database, bot
         )
         await bot.restrict_chat_member(message.chat.id, target.id, permissions=permissions)
     except Exception as e:
-        await message.answer(phrases.ERR_ACTION_FAILED.format(error=esc(e)))
+        await message.reply(phrases.ERR_ACTION_FAILED.format(error=esc(e)))
         return
+    await try_delete_command_message(message)
     name = await display(db, message.chat.id, target)
     await message.answer(phrases.UNMUTE_SUCCESS.format(user=name))
 
 
 @router.message(Command("варн", ignore_case=True))
-async def cmd_warn(message: Message, command: CommandObject, db: Database, bot: Bot):
-    await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=2, usage=phrases.USAGE_WARN)
+@router.message(kw("варн"))
+async def cmd_warn(message: Message, db: Database, bot: Bot):
+    """варн [число][ч|д|н|м] [причина] [@username] — варн с истечением; 3-й активный варн = бан."""
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=2,
+                                    usage=phrases.USAGE_WARN_LINE)
     if not prepared:
         return
-    target, args = prepared
-    chat_id = message.chat.id
-    reason = args or "Без причины"
-    warn_count = await db.add_warn(chat_id, target.id)
-    name = await display(db, chat_id, target)
+    target, rest = prepared
 
-    if warn_count >= 3:
+    parts = rest.split(maxsplit=1)
+    duration = parse_warn_duration(parts[0]) if parts else None
+    if duration is None:
+        await message.reply(phrases.USAGE_WARN)
+        return
+    if duration > MAX_WARN_DURATION:
+        await message.reply(phrases.ERR_WARN_TOO_LONG.format(days=MAX_WARN_DURATION.days))
+        return
+    reason = " ".join(parts[1].split()) if len(parts) > 1 else ""
+    if len(reason) > MAX_REASON_LEN:
+        await message.reply(phrases.ERR_TOO_LONG.format(limit=MAX_REASON_LEN))
+        return
+
+    chat_id = message.chat.id
+    name = await display(db, chat_id, target)
+    now = int(time.time())
+
+    # Защита: не чаще одного варна в час на пользователя
+    last_warn = await db.get_last_warn_time(chat_id, target.id)
+    if last_warn and now - last_warn < WARN_COOLDOWN_SECONDS:
+        minutes_left = math.ceil((WARN_COOLDOWN_SECONDS - (now - last_warn)) / 60)
+        await message.reply(phrases.ERR_WARN_COOLDOWN.format(user=name, minutes=minutes_left))
+        return
+
+    # Лимит: при выдаче 3-го активного варна — бан (сначала бан, и только при успехе чистим варны)
+    if await db.get_total_warns(chat_id, target.id) >= MAX_ACTIVE_WARNS:
         try:
             await bot.ban_chat_member(chat_id, target.id)
         except Exception as e:
-            await message.answer(phrases.ERR_ACTION_FAILED.format(error=esc(e)))
+            await message.reply(phrases.ERR_ACTION_FAILED.format(error=esc(e)))
             return
         await db.reset_warns(chat_id, target.id)
+        await try_delete_command_message(message)
         await message.answer(phrases.WARN_LIMIT_REACHED.format(user=name))
-    else:
-        await message.answer(phrases.WARN_SUCCESS.format(user=name, count=warn_count, reason=esc(reason)))
+        return
+
+    expires_at = now + int(duration.total_seconds())
+    count = await db.add_temp_warn(chat_id, target.id, expires_at,
+                                   issued_by=message.from_user.id, reason=reason or None)
+    await try_delete_command_message(message)
+    await message.answer(phrases.WARN_SUCCESS.format(
+        user=name, count=count, limit=MAX_ACTIVE_WARNS + 1, until=format_datetime(expires_at),
+        reason=phrases.WARN_REASON.format(reason=esc(reason)) if reason else ""))
+
+
+@router.message(Command("снять", ignore_case=True))
+@router.message(kw_phrase("снять", "варны"))
+async def cmd_unwarn(message: Message, db: Database, bot: Bot):
+    """снять варны [число] [@username] — число по умолчанию 1."""
+    head, _, tail = get_args(message).partition(" ")
+    if head.casefold() != "варны":  # «/снять 2» без слова «варны» — ошибка структуры
+        await message.reply(phrases.USAGE_UNWARN)
+        return
+    prepared = await prepare_target(message, tail, db, bot, min_level=2, hierarchy=False,
+                                    usage=phrases.USAGE_UNWARN_LINE)
+    if not prepared:
+        return
+    target, rest = prepared
+
+    tokens = rest.split()
+    if len(tokens) > 1 or (tokens and (not is_number(tokens[0]) or int(tokens[0]) < 1)):
+        await message.reply(phrases.USAGE_UNWARN)
+        return
+    amount = min(int(tokens[0]), 99) if tokens else 1
+
+    chat_id = message.chat.id
+    name = await display(db, chat_id, target)
+    before = await db.get_total_warns(chat_id, target.id)
+    if before == 0:
+        await message.reply(phrases.UNWARN_NONE.format(user=name))
+        return
+    after = await db.decrease_warn(chat_id, target.id, amount)
+    await try_delete_command_message(message)
+    await message.answer(phrases.UNWARN_SUCCESS.format(user=name, count=before - after, total=after))
 
 
 @router.message(Command("бан", ignore_case=True))
-async def cmd_ban(message: Message, command: CommandObject, db: Database, bot: Bot):
-    await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=2, usage=phrases.USAGE_BAN)
+async def cmd_ban(message: Message, db: Database, bot: Bot):
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=2, usage=phrases.USAGE_BAN)
     if not prepared:
         return
-    target, args = prepared
-    reason = args or "Нарушение"
+    target, rest = prepared
+    reason = rest or "Нарушение"
     try:
         await bot.ban_chat_member(message.chat.id, target.id)
     except Exception as e:
-        await message.answer(phrases.ERR_ACTION_FAILED.format(error=esc(e)))
+        await message.reply(phrases.ERR_ACTION_FAILED.format(error=esc(e)))
         return
+    await try_delete_command_message(message)
     name = await display(db, message.chat.id, target)
     await message.answer(phrases.BAN_SUCCESS.format(user=name, reason=esc(reason)))
 
 
-@router.message(Command("снять", ignore_case=True))
-async def cmd_unwarn(message: Message, command: CommandObject, db: Database, bot: Bot):
-    await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=2, hierarchy=False,
-                                    usage=phrases.USAGE_UNWARN)
-    if not prepared:
-        return
-    target, args = prepared
-    amount = 1
-    if is_number(args):
-        amount = min(max(1, int(args)), 3)
-    new_total = await db.decrease_warn(message.chat.id, target.id, amount)
-    name = await display(db, message.chat.id, target)
-    await message.answer(phrases.UNWARN_SUCCESS.format(user=name, count=amount, total=new_total))
-
-
 @router.message(Command("модер", ignore_case=True))
-async def cmd_moder(message: Message, command: CommandObject, db: Database, bot: Bot):
-    await try_delete_command_message(message)
-    prepared = await prepare_target(message, command, db, bot, min_level=3,
+async def cmd_moder(message: Message, db: Database, bot: Bot):
+    prepared = await prepare_target(message, get_args(message), db, bot, min_level=3,
                                     usage=phrases.USAGE_MODER_LINE)
     if not prepared:
         return
-    target, args = prepared
+    target, rest = prepared
     chat_id = message.chat.id
-    arg = args.split()
-    if not arg or not is_number(arg[0]):
-        await message.answer(phrases.USAGE_MODER.format(max=MAX_MOD_LEVEL))
+    tokens = rest.split()
+    if len(tokens) != 1 or not is_number(tokens[0]):
+        await message.reply(phrases.USAGE_MODER.format(max=MAX_MOD_LEVEL))
         return
-    new_level = int(arg[0])
+    new_level = int(tokens[0])
     my_level = await level_of(db, chat_id, message.from_user.id)
     # Нельзя выдать уровень выше максимального и не ниже собственного (кроме создателя)
-    if new_level > MAX_MOD_LEVEL or (new_level >= my_level and my_level != 99):
-        await message.answer(phrases.ERR_BAD_LEVEL)
+    if new_level > MAX_MOD_LEVEL or (new_level >= my_level and my_level != CREATOR_LEVEL):
+        await message.reply(phrases.ERR_BAD_LEVEL)
         return
     await db.set_moderator_level(chat_id, target.id, new_level)
+    await try_delete_command_message(message)
     name = await display(db, chat_id, target)
     await message.answer(phrases.MODER_SET.format(user=name, level=new_level))
 

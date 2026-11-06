@@ -1,5 +1,4 @@
 import asyncio
-import html
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -11,8 +10,9 @@ from aiogram.types import (
 )
 
 import phrases
-from config import get_creator_id, get_quota_utc_offset, get_weekly_quota
+from config import MAX_ACTIVE_WARNS, WARN_COOLDOWN_SECONDS, get_creator_id, get_quota_utc_offset
 from db import Database
+from utils import chat_quota, esc, format_date
 
 quota_router = Router()
 
@@ -24,24 +24,16 @@ WEEK_SECONDS = 7 * 24 * 3600
 
 # ---------- помощники ----------
 
-def esc(value) -> str:
-    return html.escape(str(value), quote=False)
-
-
 def user_link(user_id: int, name: str) -> str:
     return f'<a href="tg://user?id={user_id}">{esc(name)}</a>'
-
-
-def fmt_date(ts: int) -> str:
-    return datetime.fromtimestamp(ts, timezone.utc).strftime("%d.%m.%Y")
 
 
 def joined_text(row: dict) -> str:
     # Telegram не отдаёт ботам дату вступления — её знаем, только если бот видел вступление
     if row.get("joined_at"):
-        return fmt_date(row["joined_at"])
+        return format_date(row["joined_at"])
     if row.get("first_seen"):
-        return f"неизвестно (бот видит участника с {fmt_date(row['first_seen'])})"
+        return f"неизвестно (бот видит участника с {format_date(row['first_seen'])})"
     return "неизвестно"
 
 
@@ -71,7 +63,8 @@ def confirm_keyboard(report_id: int) -> InlineKeyboardMarkup:
 
 # ---------- еженедельный отчёт ----------
 
-async def report_chat(bot: Bot, db: Database, chat_id: int, quota: int, grace_cutoff: int):
+async def report_chat(bot: Bot, db: Database, chat_id: int, grace_cutoff: int):
+    quota = await chat_quota(db, chat_id)  # норма задаётся командой /норма, у каждого чата своя
     chat = await bot.get_chat(chat_id)
     title = chat.title or str(chat_id)
 
@@ -149,10 +142,9 @@ async def report_chat(bot: Bot, db: Database, chat_id: int, quota: int, grace_cu
 
 
 async def process_week(bot: Bot, db: Database, grace_cutoff: int):
-    quota = get_weekly_quota()
     for chat_id in await db.get_group_chat_ids():
         try:
-            await report_chat(bot, db, chat_id, quota, grace_cutoff)
+            await report_chat(bot, db, chat_id, grace_cutoff)
         except Exception:
             logging.exception("Ошибка недельного отчёта для чата %s", chat_id)
 
@@ -251,14 +243,19 @@ async def on_quota_button(call: CallbackQuery, bot: Bot, db: Database):
 
     elif action == "wrn":
         try:
+            last_warn = await db.get_last_warn_time(chat_id, user_id)
+            if last_warn and int(time.time()) - last_warn < WARN_COOLDOWN_SECONDS:
+                await call.answer(phrases.QUOTA_WARN_COOLDOWN, show_alert=True)
+                return
             current = await db.get_total_warns(chat_id, user_id)
-            if current + 1 >= 3:
+            if current >= MAX_ACTIVE_WARNS:
                 await bot.ban_chat_member(chat_id, user_id)
                 await db.reset_warns(chat_id, user_id)
                 result = phrases.QUOTA_RES_WARN_BAN.format(user=who, chat=title)
                 status = "warn_ban"
             else:
-                total = await db.add_temp_warn(chat_id, user_id, int(time.time()) + WARN_DAYS * 86400)
+                total = await db.add_temp_warn(chat_id, user_id, int(time.time()) + WARN_DAYS * 86400,
+                                               issued_by=call.from_user.id, reason="недельная норма")
                 result = phrases.QUOTA_RES_WARN.format(user=who, total=total)
                 status = "warned"
                 await _safe_dm(bot, user_id, phrases.QUOTA_USER_WARNED.format(

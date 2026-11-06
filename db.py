@@ -5,7 +5,12 @@ import time
 
 import aiosqlite
 
-from config import DB_NAME
+from config import CREATOR_LEVEL, DB_NAME
+
+
+def pick_display_name(rp_name, tag, first_name, username, fallback: str = "User") -> str:
+    """Приоритет: РП-ник > тэг > Telegram first_name > @username > fallback."""
+    return rp_name or tag or first_name or (f"@{username}" if username else fallback)
 
 
 class Database:
@@ -81,6 +86,10 @@ class Database:
                 level INTEGER DEFAULT 0,
                 PRIMARY KEY (chat_id, user_id)
             );
+            CREATE TABLE IF NOT EXISTS chat_settings (
+                chat_id INTEGER PRIMARY KEY,
+                weekly_quota INTEGER
+            );
             CREATE TABLE IF NOT EXISTS temp_warns (
                 chat_id INTEGER,
                 user_id INTEGER,
@@ -119,6 +128,12 @@ class Database:
             "joined_at": "INTEGER",
             "first_seen": "INTEGER",
             "is_member": "INTEGER DEFAULT 1",
+            "reputation": "INTEGER DEFAULT 0",
+        })
+        await self._ensure_columns("temp_warns", {
+            "issued_at": "INTEGER",
+            "issued_by": "INTEGER",
+            "reason": "TEXT",
         })
 
     # --- бэкап ---
@@ -167,9 +182,7 @@ class Database:
         """, (chat_id, user_id))
         if not row:
             return fallback
-        rp_name, tag, first_name, username = row
-        # Приоритет: РП-ник > Тэг > Telegram first_name > @username
-        return rp_name or tag or first_name or (f"@{username}" if username else fallback)
+        return pick_display_name(*row, fallback=fallback)
 
     async def set_rp_name(self, chat_id: int, user_id: int, rp_name: str):
         await self._exec("""
@@ -254,7 +267,7 @@ class Database:
 
     async def get_moderator_level(self, chat_id: int, user_id: int, creator_id: int) -> int:
         if creator_id and user_id == creator_id:
-            return 99
+            return CREATOR_LEVEL
         row = await self._fetchone(
             "SELECT level FROM moderators WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         return row[0] if row else 0
@@ -275,18 +288,20 @@ class Database:
             (chat_id, user_id, int(time.time())))
         return permanent + (row[0] if row else 0)
 
-    async def add_warn(self, chat_id: int, user_id: int) -> int:
+    async def add_temp_warn(self, chat_id: int, user_id: int, expires_at: int,
+                            issued_by: int = 0, reason: str | None = None) -> int:
+        """Выдаёт варн до expires_at. Возвращает число активных варнов после выдачи."""
         await self._exec("""
-            INSERT INTO warns (chat_id, user_id, count) VALUES (?, ?, 1)
-            ON CONFLICT(chat_id, user_id) DO UPDATE SET count = count + 1
-        """, (chat_id, user_id))
+            INSERT INTO temp_warns (chat_id, user_id, expires_at, issued_at, issued_by, reason)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (chat_id, user_id, expires_at, int(time.time()), issued_by, reason))
         return await self.get_total_warns(chat_id, user_id)
 
-    async def add_temp_warn(self, chat_id: int, user_id: int, expires_at: int) -> int:
-        await self._exec(
-            "INSERT INTO temp_warns (chat_id, user_id, expires_at) VALUES (?, ?, ?)",
-            (chat_id, user_id, expires_at))
-        return await self.get_total_warns(chat_id, user_id)
+    async def get_last_warn_time(self, chat_id: int, user_id: int) -> int | None:
+        """Когда пользователю в последний раз выдавали варн (None — не выдавали / время неизвестно)."""
+        row = await self._fetchone(
+            "SELECT MAX(issued_at) FROM temp_warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        return row[0] if row and row[0] else None
 
     async def decrease_warn(self, chat_id: int, user_id: int, amount: int) -> int:
         row = await self._fetchone(
@@ -392,3 +407,42 @@ class Database:
 
     async def delete_report(self, report_id: int):
         await self._exec("DELETE FROM quota_reports WHERE id = ?", (report_id,))
+
+    # --- настройки чата ---
+
+    async def get_weekly_quota(self, chat_id: int, default: int) -> int:
+        row = await self._fetchone("SELECT weekly_quota FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        return row[0] if row and row[0] else default
+
+    async def set_weekly_quota(self, chat_id: int, quota: int):
+        await self._exec("""
+            INSERT INTO chat_settings (chat_id, weekly_quota) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET weekly_quota = excluded.weekly_quota
+        """, (chat_id, quota))
+
+    # --- профиль и неактив ---
+
+    async def get_profile(self, chat_id: int, user_id: int):
+        return await self._fetchone_dict("""
+            SELECT rp_name, tag, first_name, username,
+                   COALESCE(week_count, 0) AS week_count, message_count,
+                   joined_at, first_seen, COALESCE(reputation, 0) AS reputation
+            FROM member_stats WHERE chat_id = ? AND user_id = ?
+        """, (chat_id, user_id))
+
+    async def count_inactive_members(self, chat_id: int, quota: int) -> int:
+        row = await self._fetchone("""
+            SELECT COUNT(*) FROM member_stats
+            WHERE chat_id = ? AND COALESCE(is_member, 1) = 1 AND COALESCE(week_count, 0) < ?
+        """, (chat_id, quota))
+        return row[0] if row else 0
+
+    async def get_inactive_members(self, chat_id: int, quota: int, limit: int):
+        """Участники, не набравшие норму за текущую неделю (меньше всех сообщений — первыми)."""
+        return await self._fetchall_dict("""
+            SELECT user_id, rp_name, tag, first_name, username, COALESCE(week_count, 0) AS week_count
+            FROM member_stats
+            WHERE chat_id = ? AND COALESCE(is_member, 1) = 1 AND COALESCE(week_count, 0) < ?
+            ORDER BY week_count, user_id
+            LIMIT ?
+        """, (chat_id, quota, limit))
