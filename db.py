@@ -5,7 +5,7 @@ import time
 
 import aiosqlite
 
-from config import CREATOR_LEVEL, DB_NAME, LEVEL_OWNER
+from config import CREATOR_LEVEL, DB_NAME, MAX_ASSIGNABLE_LEVEL
 
 
 def pick_display_name(rp_name, tag, first_name, username, fallback: str = "User") -> str:
@@ -131,8 +131,8 @@ class Database:
             "reputation": "INTEGER DEFAULT 0",
             "rest_until": "INTEGER",
         })
-        # Раньше уровней было 4, теперь 3: старый «4» становится «3»
-        await self._exec("UPDATE moderators SET level = ? WHERE level > ?", (LEVEL_OWNER, LEVEL_OWNER))
+        # Владелец больше не выдаётся (он определяется по Telegram): старые «3» и «4» становятся «2»
+        await self._exec("UPDATE moderators SET level = ? WHERE level > ?", (MAX_ASSIGNABLE_LEVEL, MAX_ASSIGNABLE_LEVEL))
         await self._ensure_columns("temp_warns", {
             "issued_at": "INTEGER",
             "issued_by": "INTEGER",
@@ -171,7 +171,9 @@ class Database:
                 is_member = CASE WHEN ? > 0 THEN 1 ELSE is_member END
         """, (chat_id, user_id, username, first_name, inc, inc, int(time.time()), inc, inc, inc))
 
-    async def update_activity(self, chat_id: int, user_id: int, username: str | None, first_name: str | None):
+    async def record_message(self, chat_id: int, user_id: int, username: str | None, first_name: str | None):
+        """ЕДИНСТВЕННОЕ место, где растут счётчики сообщений (вызывается из activity.ActivityMiddleware).
+        Общий и недельный счётчики увеличиваются одной командой, поэтому не могут разойтись."""
         await self._upsert_user(chat_id, user_id, username, first_name, 1)
 
     async def touch_user(self, chat_id: int, user_id: int, username: str | None, first_name: str | None):
@@ -207,16 +209,19 @@ class Database:
         return row[0] if row else None
 
     async def get_top_users(self, chat_id: int, limit: int, offset: int):
+        """Топ по сообщениям за неделю (то же число, что в профиле); при равенстве — по общему счёту."""
         return await self._fetchall("""
-            SELECT user_id, message_count FROM member_stats
-            WHERE chat_id = ? AND message_count > 0
-            ORDER BY message_count DESC, user_id
+            SELECT user_id, COALESCE(week_count, 0), message_count FROM member_stats
+            WHERE chat_id = ? AND message_count > 0 AND COALESCE(is_member, 1) = 1
+            ORDER BY COALESCE(week_count, 0) DESC, message_count DESC, user_id
             LIMIT ? OFFSET ?
         """, (chat_id, limit, offset))
 
     async def get_total_users_count(self, chat_id: int) -> int:
-        row = await self._fetchone(
-            "SELECT COUNT(*) FROM member_stats WHERE chat_id = ? AND message_count > 0", (chat_id,))
+        row = await self._fetchone("""
+            SELECT COUNT(*) FROM member_stats
+            WHERE chat_id = ? AND message_count > 0 AND COALESCE(is_member, 1) = 1
+        """, (chat_id,))
         return row[0] if row else 0
 
     async def get_random_user(self, chat_id: int) -> int | None:

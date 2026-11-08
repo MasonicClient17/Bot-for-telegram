@@ -93,6 +93,38 @@ async def send_profile(message: Message, user: types.User, db: Database, bot: Bo
     await message.reply(await build_profile(db, bot, message.chat.id, user))
 
 
+# ---------- актив ----------
+
+@profile_router.message(Command("актив", ignore_case=True))
+@profile_router.message(kw("актив"))
+async def cmd_active(message: Message, db: Database):
+    """Топ по сообщениям за неделю. Числа — те же, что в профиле: все читают одни и те же счётчики из базы."""
+    parts = get_args(message).split()
+    if len(parts) > 1 or (parts and not is_number(parts[0])):
+        await message.reply(phrases.USAGE_ACTIVE)
+        return
+    await try_delete_command_message(message)
+    chat_id = message.chat.id
+    total_users = await db.get_total_users_count(chat_id)
+    if total_users == 0:
+        await message.answer(phrases.EMPTY_ACTIVITY)
+        return
+
+    limit = 20
+    total_pages = (total_users + limit - 1) // limit
+    page = min(max(1, int(parts[0]) if parts else 1), total_pages)
+    offset = (page - 1) * limit
+    quota = await chat_quota(db, chat_id)
+
+    text = phrases.ACTIVITY_HEADER.format(page=page, total=total_pages, quota=quota)
+    for idx, (user_id, week_count, total_count) in enumerate(
+            await db.get_top_users(chat_id, limit, offset), start=offset + 1):
+        name = esc(await db.get_display_name(chat_id, user_id))
+        text += phrases.ACTIVITY_LINE.format(
+            index=idx, name=name, week=week_count, emoji=activity_emoji(week_count, quota), total=total_count)
+    await message.answer(text)
+
+
 # ---------- кто я / кто ты ----------
 
 @profile_router.message(kw_phrase("кто", "я"))

@@ -55,7 +55,19 @@ def get_quota_utc_offset() -> float:
 # Уровни модерации (в базе хранятся 1–3)
 LEVEL_HELPER = 1            # Хелпер: модератор 1-го порядка (без админки в Telegram-группе)
 LEVEL_ADMIN = 2             # Админ: модератор 2-го порядка (с админкой в Telegram-группе)
-LEVEL_OWNER = 3             # Владелец: модератор 3-го порядка; им же автоматически считается владелец группы
-CREATOR_LEVEL = 99          # скрытый суперпользователь (CREATOR_ID): все права, но в профиле статуса нет
+LEVEL_OWNER = 3             # Владелец: модератор 3-го порядка. НЕ выдаётся: это тот, кто владелец группы в Telegram
+CREATOR_LEVEL = 666         # скрытый суперпользователь (CREATOR_ID): все права, но в профиле статуса нет
+MAX_ASSIGNABLE_LEVEL = LEVEL_ADMIN  # командой /модер можно выдать только 1 и 2
+
+# Права, которые бот выдаёт в Telegram при назначении роли «Админ» (без права назначать других админов)
+ADMIN_RIGHTS = {
+    "is_anonymous": False,
+    "can_manage_chat": True,
+    "can_delete_messages": True,
+    "can_restrict_members": True,
+    "can_invite_users": True,
+    "can_pin_messages": True,
+    "can_manage_video_chats": True,
+}
 MAX_ACTIVE_WARNS = 2        # столько варнов можно иметь одновременно; следующий (3-й) = бан
 WARN_COOLDOWN_SECONDS = 3600  # не чаще одного варна в час на пользователя

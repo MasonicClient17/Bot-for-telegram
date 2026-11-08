@@ -11,6 +11,8 @@ import phrases
 from backup import restore_from_pinned, send_backup
 from config import DB_NAME, get_backup_interval_hours, get_storage_chat_id
 from db import Database
+from activity import ActivityMiddleware
+from cleanup import cleanup_router
 from handlers import router
 from member_profile import profile_router
 from quota import quota_router, weekly_loop
@@ -86,8 +88,10 @@ async def main():
 
     dp.include_router(quota_router)
     dp.include_router(profile_router)
+    dp.include_router(cleanup_router)
     dp.include_router(router)  # последним: в нём общий обработчик текста
     dp["db"] = db
+    dp.message.outer_middleware(ActivityMiddleware(db))  # единственная точка подсчёта сообщений
 
     weekly_task = asyncio.create_task(weekly_loop(bot, db))
     backup_task = None

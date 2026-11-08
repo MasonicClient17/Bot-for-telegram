@@ -14,12 +14,12 @@ from aiogram.types import Message
 import phrases
 from backup import send_backup
 from config import (
-    CREATOR_LEVEL, LEVEL_ADMIN, LEVEL_HELPER, LEVEL_OWNER, MAX_ACTIVE_WARNS, WARN_COOLDOWN_SECONDS,
-    get_storage_chat_id,
+    ADMIN_RIGHTS, LEVEL_ADMIN, LEVEL_HELPER, LEVEL_OWNER, MAX_ACTIVE_WARNS, MAX_ASSIGNABLE_LEVEL,
+    WARN_COOLDOWN_SECONDS, get_storage_chat_id,
 )
 from db import Database
 from utils import (
-    answer_long, display, esc, format_datetime, get_args, is_group, is_number, kw,
+    answer_long, display, esc, format_datetime, get_args, get_chat_owner_id, is_group, is_number, kw,
     level_of, prepare_target, try_delete_command_message, get_reply_user,
 )
 
@@ -27,7 +27,6 @@ router = Router()
 # Сообщения без отправителя (каналы и т.п.) обрабатывать не нужно
 router.message.filter(F.from_user)
 
-MAX_MOD_LEVEL = LEVEL_OWNER  # уровни: 1 Хелпер, 2 Админ, 3 Владелец
 TAG_MIN_LEVEL = LEVEL_HELPER  # кто может ставить тэги (0 — все)
 SAVE_MIN_LEVEL = LEVEL_OWNER  # ручной бэкап /save
 MAX_NAME_LEN = 32
@@ -45,7 +44,7 @@ _last_call: dict[int, float] = {}
 SYSTEM_COMMANDS = {
     "мут", "размут", "варн", "-варн", "бан", "модер", "актив", "рест", "-рест",
     "ник", "-ник", "тэг", "команда", "-команда", "команды", "save", "start", "калл", "помощь",
-    "кто", "норма", "неактив",
+    "кто", "норма", "неактив", "чистка",
 }
 
 COMMAND_NAME_RE = re.compile(r"[\w-]{1,32}")
@@ -204,35 +203,7 @@ async def cmd_delete_rp_command(message: Message, db: Database, bot: Bot):
     await message.answer(phrases.COMMAND_DELETED.format(name=esc(cmd_name)))
 
 
-# ---------- активность и справка ----------
-
-@router.message(Command("актив", ignore_case=True))
-@router.message(kw("актив"))
-async def cmd_active(message: Message, db: Database):
-    parts = get_args(message).split()
-    if len(parts) > 1 or (parts and not is_number(parts[0])):
-        await message.reply(phrases.USAGE_ACTIVE)
-        return
-    await try_delete_command_message(message)
-    chat_id = message.chat.id
-    total_users = await db.get_total_users_count(chat_id)
-    if total_users == 0:
-        await message.answer(phrases.EMPTY_ACTIVITY)
-        return
-
-    limit = 20
-    total_pages = (total_users + limit - 1) // limit
-    page = int(parts[0]) if parts else 1
-    page = min(max(1, page), total_pages)
-    offset = (page - 1) * limit
-
-    top_users = await db.get_top_users(chat_id, limit, offset)
-    text = phrases.ACTIVITY_HEADER.format(page=page, total=total_pages)
-    for idx, (user_id, count) in enumerate(top_users, start=offset + 1):
-        name = esc(await db.get_display_name(chat_id, user_id))
-        text += phrases.ACTIVITY_LINE.format(index=idx, name=name, count=count)
-    await message.answer(text)
-
+# ---------- справка ----------
 
 @router.message(Command("помощь", ignore_case=True))
 @router.message(kw("помощь"))
@@ -435,8 +406,25 @@ async def cmd_ban(message: Message, db: Database, bot: Bot):
     await message.answer(phrases.BAN_SUCCESS.format(user=name, reason=esc(reason)))
 
 
+async def sync_telegram_admin(bot: Bot, chat_id: int, user_id: int, old_level: int, new_level: int) -> str:
+    """Связка роли «Админ» с админкой в Telegram: выдаёт её при назначении и снимает при снятии роли.
+    Возвращает строку для ответа ('' — ничего менять не пришлось)."""
+    try:
+        status = (await bot.get_chat_member(chat_id, user_id)).status
+        if new_level == LEVEL_ADMIN and status not in ("administrator", "creator"):
+            await bot.promote_chat_member(chat_id, user_id, **ADMIN_RIGHTS)
+            return phrases.MODER_TG_PROMOTED
+        if old_level == LEVEL_ADMIN and new_level < LEVEL_ADMIN and status == "administrator":
+            await bot.promote_chat_member(chat_id, user_id, **{right: False for right in ADMIN_RIGHTS})
+            return phrases.MODER_TG_DEMOTED
+    except Exception as e:
+        return phrases.MODER_TG_FAILED.format(error=esc(e))
+    return ""
+
+
 @router.message(Command("модер", ignore_case=True))
 async def cmd_moder(message: Message, db: Database, bot: Bot):
+    """/модер [уровень 0–2] [@username]. Владелец (3) не выдаётся: это владелец группы в Telegram."""
     prepared = await prepare_target(message, get_args(message), db, bot, min_level=LEVEL_OWNER,
                                     usage=phrases.USAGE_MODER_LINE)
     if not prepared:
@@ -445,18 +433,27 @@ async def cmd_moder(message: Message, db: Database, bot: Bot):
     chat_id = message.chat.id
     tokens = rest.split()
     if len(tokens) != 1 or not is_number(tokens[0]):
-        await message.reply(phrases.USAGE_MODER.format(max=MAX_MOD_LEVEL))
+        await message.reply(phrases.USAGE_MODER.format(max=MAX_ASSIGNABLE_LEVEL))
         return
     new_level = int(tokens[0])
-    my_level = await level_of(db, bot, chat_id, message.from_user.id)
-    # Нельзя выдать уровень выше максимального и не ниже собственного (кроме создателя)
-    if new_level > MAX_MOD_LEVEL or (new_level >= my_level and my_level != CREATOR_LEVEL):
+    if new_level > MAX_ASSIGNABLE_LEVEL:
         await message.reply(phrases.ERR_BAD_LEVEL)
         return
+    if target.is_bot:
+        await message.reply(phrases.ERR_BOT_TARGET)
+        return
+    if target.id == await get_chat_owner_id(bot, chat_id):
+        await message.reply(phrases.ERR_OWNER_FIXED)
+        return
+
+    old_level = await db.get_stored_moderator_level(chat_id, target.id)
     await db.set_moderator_level(chat_id, target.id, new_level)
+    tg_note = await sync_telegram_admin(bot, chat_id, target.id, old_level, new_level)
     await try_delete_command_message(message)
     name = await display(db, chat_id, target)
-    await message.answer(phrases.MODER_SET.format(user=name, level=new_level))
+    text = phrases.MODER_SET.format(
+        user=name, level=new_level, role=phrases.MOD_STATUS_NAMES.get(new_level, phrases.STATUS_MEMBER))
+    await message.answer(text + (f"\n{tg_note}" if tg_note else ""))
 
 
 # ---------- бэкап ----------
@@ -547,10 +544,11 @@ async def cmd_call_everyone(message: Message, db: Database, bot: Bot):
         await asyncio.sleep(1)  # лимит Telegram: ~20 сообщений в минуту на группу
 
 
-# ---------- РП-команды пользователей и подсчёт активности ----------
+# ---------- вызов РП-команд пользователей ----------
+# Сообщения здесь НЕ считаются: подсчёт делает activity.ActivityMiddleware для всех сообщений сразу.
 
 @router.message(F.text)
-async def handle_custom_rp_and_activity(message: Message, db: Database, bot: Bot):
+async def handle_rp_command(message: Message, db: Database, bot: Bot):
     if not is_group(message):
         return
     raw_text = message.text.strip()
@@ -587,11 +585,3 @@ async def handle_custom_rp_and_activity(message: Message, db: Database, bot: Bot
         text = PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], esc(template))
         await message.answer(text)
         return
-
-    if not message.from_user.is_bot:
-        await db.update_activity(
-            chat_id=chat_id,
-            user_id=message.from_user.id,
-            username=message.from_user.username,
-            first_name=message.from_user.first_name,
-        )
