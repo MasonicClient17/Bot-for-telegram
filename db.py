@@ -26,6 +26,8 @@ class Database:
             await self.conn.close()
             self.conn = None
 
+    # --- низкоуровневые помощники ---
+
     async def _exec(self, sql: str, params: tuple = ()) -> int:
         async with self.conn.execute(sql, params) as cur:
             rowcount = cur.rowcount
@@ -86,7 +88,10 @@ class Database:
             );
             CREATE TABLE IF NOT EXISTS chat_settings (
                 chat_id INTEGER PRIMARY KEY,
-                weekly_quota INTEGER
+                weekly_quota INTEGER,
+                daily_min INTEGER DEFAULT 10,
+                daily_max INTEGER DEFAULT 50,
+                rest_price INTEGER DEFAULT 100
             );
             CREATE TABLE IF NOT EXISTS temp_warns (
                 chat_id INTEGER,
@@ -118,12 +123,17 @@ class Database:
                 author_id INTEGER,
                 PRIMARY KEY (chat_id, name)
             );
-            CREATE TABLE IF NOT EXISTS triggers (
+            CREATE TABLE IF NOT EXISTS rep_triggers (
                 chat_id INTEGER,
-                type TEXT,
-                keyword TEXT,
-                action TEXT,
-                PRIMARY KEY (chat_id, type, keyword)
+                phrase TEXT,
+                delta INTEGER,
+                PRIMARY KEY (chat_id, phrase)
+            );
+            CREATE TABLE IF NOT EXISTS tabu_triggers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                phrase TEXT,
+                action_cmd TEXT
             );
         """)
         await self._ensure_columns("rp_commands", {"author_id": "INTEGER"})
@@ -135,11 +145,12 @@ class Database:
             "reputation": "INTEGER DEFAULT 0",
             "rest_until": "INTEGER",
             "cassettes": "INTEGER DEFAULT 0",
-            "last_daily_claim": "TEXT",
+            "last_daily": "TEXT",
         })
         await self._ensure_columns("chat_settings", {
-            "daily_reward": "TEXT",
-            "rest_price": "INTEGER DEFAULT 1",
+            "daily_min": "INTEGER DEFAULT 10",
+            "daily_max": "INTEGER DEFAULT 50",
+            "rest_price": "INTEGER DEFAULT 100",
         })
         await self._exec("UPDATE moderators SET level = ? WHERE level > ?", (MAX_ASSIGNABLE_LEVEL, MAX_ASSIGNABLE_LEVEL))
         await self._ensure_columns("temp_warns", {
@@ -306,28 +317,6 @@ class Database:
             "SELECT MAX(issued_at) FROM temp_warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         return row[0] if row and row[0] else None
 
-    async def get_warned_users(self, chat_id: int):
-        """Возвращает список пользователей, у которых есть активные варны."""
-        rows = await self._fetchall("""
-            SELECT DISTINCT user_id FROM temp_warns
-            WHERE chat_id = ? AND expires_at > ?
-        """, (chat_id, int(time.time())))
-        warned_ids = {r[0] for r in rows}
-        perm_rows = await self._fetchall("""
-            SELECT user_id FROM warns WHERE chat_id = ? AND count > 0
-        """, (chat_id,))
-        for r in perm_rows:
-            warned_ids.add(r[0])
-        return list(warned_ids)
-
-    async def get_user_warn_details(self, chat_id: int, user_id: int):
-        """Возвращает список деталей активных варнов пользователя."""
-        return await self._fetchall_dict("""
-            SELECT issued_at, expires_at, issued_by, reason FROM temp_warns
-            WHERE chat_id = ? AND user_id = ? AND expires_at > ?
-            ORDER BY issued_at DESC
-        """, (chat_id, user_id, int(time.time())))
-
     async def decrease_warn(self, chat_id: int, user_id: int, amount: int) -> int:
         row = await self._fetchone(
             "SELECT count FROM warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
@@ -354,6 +343,83 @@ class Database:
 
     async def cleanup_expired_warns(self):
         await self._exec("DELETE FROM temp_warns WHERE expires_at <= ?", (int(time.time()),))
+
+    async def get_warned_users(self, chat_id: int):
+        now = int(time.time())
+        rows = await self._fetchall("""
+            SELECT user_id, COUNT(*) as cnt FROM temp_warns
+            WHERE chat_id = ? AND expires_at > ?
+            GROUP BY user_id
+        """, (chat_id, now))
+        warns_dict = {r[0]: r[1] for r in rows}
+        perm_rows = await self._fetchall("SELECT user_id, count FROM warns WHERE chat_id = ? AND count > 0", (chat_id,))
+        for u_id, c in perm_rows:
+            warns_dict[u_id] = warns_dict.get(u_id, 0) + c
+        return list(warns_dict.items())
+
+    async def get_user_warn_details(self, chat_id: int, user_id: int):
+        now = int(time.time())
+        return await self._fetchall_dict("""
+            SELECT expires_at, issued_at, issued_by, reason FROM temp_warns
+            WHERE chat_id = ? AND user_id = ? AND expires_at > ?
+            ORDER BY expires_at ASC
+        """, (chat_id, user_id, now))
+
+    async def change_reputation(self, chat_id: int, user_id: int, delta: int):
+        await self._exec("""
+            INSERT INTO member_stats (chat_id, user_id, reputation, first_seen) VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET reputation = COALESCE(reputation, 0) + ?
+        """, (chat_id, user_id, delta, int(time.time()), delta))
+
+    async def get_cassettes(self, chat_id: int, user_id: int) -> int:
+        row = await self._fetchone("SELECT COALESCE(cassettes, 0) FROM member_stats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        return row[0] if row else 0
+
+    async def add_cassettes(self, chat_id: int, user_id: int, amount: int):
+        await self._exec("""
+            INSERT INTO member_stats (chat_id, user_id, cassettes, first_seen) VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET cassettes = COALESCE(cassettes, 0) + ?
+        """, (chat_id, user_id, amount, int(time.time()), amount))
+
+    async def transfer_cassettes(self, chat_id: int, from_user_id: int, to_user_id: int, amount: int) -> bool:
+        cur = await self.get_cassettes(chat_id, from_user_id)
+        if cur < amount:
+            return False
+        await self.add_cassettes(chat_id, from_user_id, -amount)
+        await self.add_cassettes(chat_id, to_user_id, amount)
+        return True
+
+    async def claim_daily(self, chat_id: int, user_id: int, day_str: str, reward: int) -> bool:
+        row = await self._fetchone("SELECT last_daily FROM member_stats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        if row and row[0] == day_str:
+            return False
+        await self._exec("""
+            INSERT INTO member_stats (chat_id, user_id, cassettes, last_daily, first_seen) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET cassettes = COALESCE(cassettes, 0) + ?, last_daily = ?
+        """, (chat_id, user_id, reward, day_str, int(time.time()), reward, day_str))
+        return True
+
+    async def add_rep_trigger(self, chat_id: int, phrase: str, delta: int):
+        await self._exec("""
+            INSERT INTO rep_triggers (chat_id, phrase, delta) VALUES (?, ?, ?)
+            ON CONFLICT(chat_id, phrase) DO UPDATE SET delta = excluded.delta
+        """, (chat_id, phrase.lower(), delta))
+
+    async def remove_rep_trigger(self, chat_id: int, phrase: str) -> bool:
+        return await self._exec("DELETE FROM rep_triggers WHERE chat_id = ? AND phrase = ?", (chat_id, phrase.lower())) > 0
+
+    async def get_rep_triggers(self, chat_id: int):
+        return await self._fetchall("SELECT phrase, delta FROM rep_triggers WHERE chat_id = ?", (chat_id,))
+
+    async def add_tabu_trigger(self, chat_id: int, phrase: str, action_cmd: str):
+        await self._exec("INSERT INTO tabu_triggers (chat_id, phrase, action_cmd) VALUES (?, ?, ?)",
+                         (chat_id, phrase.lower(), action_cmd))
+
+    async def remove_tabu_trigger(self, chat_id: int, phrase: str) -> bool:
+        return await self._exec("DELETE FROM tabu_triggers WHERE chat_id = ? AND phrase = ?", (chat_id, phrase.lower())) > 0
+
+    async def get_tabu_triggers(self, chat_id: int):
+        return await self._fetchall("SELECT phrase, action_cmd FROM tabu_triggers WHERE chat_id = ?", (chat_id,))
 
     async def get_meta(self, key: str) -> str | None:
         row = await self._fetchone("SELECT value FROM meta WHERE key = ?", (key,))
@@ -437,6 +503,28 @@ class Database:
             ON CONFLICT(chat_id) DO UPDATE SET weekly_quota = excluded.weekly_quota
         """, (chat_id, quota))
 
+    async def get_daily_range(self, chat_id: int) -> tuple[int, int]:
+        row = await self._fetchone("SELECT daily_min, daily_max FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        if row and row[0] is not None and row[1] is not None:
+            return row[0], row[1]
+        return 10, 50
+
+    async def set_daily_range(self, chat_id: int, d_min: int, d_max: int):
+        await self._exec("""
+            INSERT INTO chat_settings (chat_id, daily_min, daily_max) VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET daily_min = excluded.daily_min, daily_max = excluded.daily_max
+        """, (chat_id, d_min, d_max))
+
+    async def get_rest_price(self, chat_id: int) -> int:
+        row = await self._fetchone("SELECT rest_price FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        return row[0] if row and row[0] is not None else 100
+
+    async def set_rest_price(self, chat_id: int, price: int):
+        await self._exec("""
+            INSERT INTO chat_settings (chat_id, rest_price) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET rest_price = excluded.rest_price
+        """, (chat_id, price))
+
     async def get_profile(self, chat_id: int, user_id: int):
         return await self._fetchone_dict("""
             SELECT rp_name, tag, first_name, username,
@@ -475,60 +563,3 @@ class Database:
             WHERE chat_id = ? AND user_id = ? AND COALESCE(rest_until, 0) > ?
         """, (chat_id, user_id, int(time.time())))
         return rows > 0
-
-    # --- Новые методы для Кассет, Репутации и Триггеров ---
-
-    async def add_cassettes(self, chat_id: int, user_id: int, amount: int):
-        await self._exec("""
-            INSERT INTO member_stats (chat_id, user_id, cassettes, first_seen) VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id, user_id) DO UPDATE SET cassettes = COALESCE(cassettes, 0) + ?
-        """, (chat_id, user_id, max(0, amount), int(time.time()), amount))
-
-    async def get_cassettes(self, chat_id: int, user_id: int) -> int:
-        row = await self._fetchone("SELECT COALESCE(cassettes, 0) FROM member_stats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-        return row[0] if row else 0
-
-    async def set_reputation(self, chat_id: int, user_id: int, delta: int):
-        await self._exec("""
-            INSERT INTO member_stats (chat_id, user_id, reputation, first_seen) VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id, user_id) DO UPDATE SET reputation = COALESCE(reputation, 0) + ?
-        """, (chat_id, user_id, delta, int(time.time()), delta))
-
-    async def get_daily_reward(self, chat_id: int) -> str | None:
-        row = await self._fetchone("SELECT daily_reward FROM chat_settings WHERE chat_id = ?", (chat_id,))
-        return row[0] if row else None
-
-    async def set_daily_reward(self, chat_id: int, val: str):
-        await self._exec("""
-            INSERT INTO chat_settings (chat_id, daily_reward) VALUES (?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET daily_reward = excluded.daily_reward
-        """, (chat_id, val))
-
-    async def get_rest_price(self, chat_id: int) -> int:
-        row = await self._fetchone("SELECT COALESCE(rest_price, 1) FROM chat_settings WHERE chat_id = ?", (chat_id,))
-        return row[0] if row and row[0] else 1
-
-    async def set_rest_price(self, chat_id: int, price: int):
-        await self._exec("""
-            INSERT INTO chat_settings (chat_id, rest_price) VALUES (?, ?)
-            ON CONFLICT(chat_id) DO UPDATE SET rest_price = excluded.rest_price
-        """, (chat_id, price))
-
-    async def add_trigger(self, chat_id: int, t_type: str, keyword: str, action: str):
-        await self._exec("""
-            INSERT INTO triggers (chat_id, type, keyword, action) VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id, type, keyword) DO UPDATE SET action = excluded.action
-        """, (chat_id, t_type, keyword.lower(), action))
-
-    async def get_triggers(self, chat_id: int, t_type: str):
-        return await self._fetchall("SELECT keyword, action FROM triggers WHERE chat_id = ? AND type = ?", (chat_id, t_type))
-
-    async def get_last_daily_claim(self, chat_id: int, user_id: int) -> str | None:
-        row = await self._fetchone("SELECT last_daily_claim FROM member_stats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
-        return row[0] if row else None
-
-    async def set_last_daily_claim(self, chat_id: int, user_id: int, date_str: str):
-        await self._exec("""
-            INSERT INTO member_stats (chat_id, user_id, last_daily_claim, first_seen) VALUES (?, ?, ?, ?)
-            ON CONFLICT(chat_id, user_id) DO UPDATE SET last_daily_claim = excluded.last_daily_claim
-        """, (chat_id, user_id, date_str, int(time.time())))
