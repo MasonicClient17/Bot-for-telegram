@@ -26,8 +26,6 @@ class Database:
             await self.conn.close()
             self.conn = None
 
-    # --- низкоуровневые помощники ---
-
     async def _exec(self, sql: str, params: tuple = ()) -> int:
         async with self.conn.execute(sql, params) as cur:
             rowcount = cur.rowcount
@@ -120,8 +118,14 @@ class Database:
                 author_id INTEGER,
                 PRIMARY KEY (chat_id, name)
             );
+            CREATE TABLE IF NOT EXISTS triggers (
+                chat_id INTEGER,
+                type TEXT,
+                keyword TEXT,
+                action TEXT,
+                PRIMARY KEY (chat_id, type, keyword)
+            );
         """)
-        # Миграции для старых баз и старых бэкапов: недостающие колонки добавляются сами
         await self._ensure_columns("rp_commands", {"author_id": "INTEGER"})
         await self._ensure_columns("member_stats", {
             "week_count": "INTEGER DEFAULT 0",
@@ -130,8 +134,13 @@ class Database:
             "is_member": "INTEGER DEFAULT 1",
             "reputation": "INTEGER DEFAULT 0",
             "rest_until": "INTEGER",
+            "cassettes": "INTEGER DEFAULT 0",
+            "last_daily_claim": "TEXT",
         })
-        # Владелец больше не выдаётся (он определяется по Telegram): старые «3» и «4» становятся «2»
+        await self._ensure_columns("chat_settings", {
+            "daily_reward": "TEXT",
+            "rest_price": "INTEGER DEFAULT 1",
+        })
         await self._exec("UPDATE moderators SET level = ? WHERE level > ?", (MAX_ASSIGNABLE_LEVEL, MAX_ASSIGNABLE_LEVEL))
         await self._ensure_columns("temp_warns", {
             "issued_at": "INTEGER",
@@ -139,10 +148,7 @@ class Database:
             "reason": "TEXT",
         })
 
-    # --- бэкап ---
-
     async def make_snapshot(self, target_path: str):
-        """Консистентная копия БД (VACUUM INTO), а не копирование «живого» файла."""
         last_error = None
         for _ in range(5):
             if os.path.exists(target_path):
@@ -151,12 +157,10 @@ class Database:
                 await self.conn.commit()
                 await self.conn.execute("VACUUM INTO ?", (target_path,))
                 return
-            except sqlite3.OperationalError as e:  # например, пока идёт чужая транзакция
+            except sqlite3.OperationalError as e:
                 last_error = e
                 await asyncio.sleep(0.3)
         raise last_error
-
-    # --- пользователи и активность ---
 
     async def _upsert_user(self, chat_id, user_id, username, first_name, inc: int):
         await self._exec("""
@@ -172,12 +176,9 @@ class Database:
         """, (chat_id, user_id, username, first_name, inc, inc, int(time.time()), inc, inc, inc))
 
     async def record_message(self, chat_id: int, user_id: int, username: str | None, first_name: str | None):
-        """ЕДИНСТВЕННОЕ место, где растут счётчики сообщений (вызывается из activity.ActivityMiddleware).
-        Общий и недельный счётчики увеличиваются одной командой, поэтому не могут разойтись."""
         await self._upsert_user(chat_id, user_id, username, first_name, 1)
 
     async def touch_user(self, chat_id: int, user_id: int, username: str | None, first_name: str | None):
-        """Запоминает пользователя (ник, username), не увеличивая счётчик сообщений."""
         await self._upsert_user(chat_id, user_id, username, first_name, 0)
 
     async def get_display_name(self, chat_id: int, user_id: int, fallback: str = "User") -> str:
@@ -209,7 +210,6 @@ class Database:
         return row[0] if row else None
 
     async def get_top_users(self, chat_id: int, limit: int, offset: int):
-        """Топ по сообщениям за неделю (то же число, что в профиле); при равенстве — по общему счёту."""
         return await self._fetchall("""
             SELECT user_id, COALESCE(week_count, 0), message_count FROM member_stats
             WHERE chat_id = ? AND message_count > 0 AND COALESCE(is_member, 1) = 1
@@ -233,7 +233,6 @@ class Database:
         return row[0] if row else None
 
     async def get_member_ids(self, chat_id: int, exclude_user_id: int, limit: int) -> list[int]:
-        """Известные боту участники чата (самые активные первыми) — для команды «калл»."""
         rows = await self._fetchall("""
             SELECT user_id FROM member_stats
             WHERE chat_id = ? AND user_id != ? AND COALESCE(is_member, 1) = 1
@@ -242,17 +241,13 @@ class Database:
         """, (chat_id, exclude_user_id, limit))
         return [r[0] for r in rows]
 
-    # --- РП-команды ---
-
     async def add_rp_command(self, chat_id: int, name: str, text: str, author_id: int) -> bool:
-        """False, если команда с таким именем уже есть."""
         rows = await self._exec(
             "INSERT OR IGNORE INTO rp_commands (chat_id, name, text, author_id) VALUES (?, ?, ?, ?)",
             (chat_id, name.lower(), text, author_id))
         return rows == 1
 
     async def get_rp_command_info(self, chat_id: int, name: str):
-        """(существует, author_id). У команд, созданных до обновления, author_id = None."""
         row = await self._fetchone(
             "SELECT author_id FROM rp_commands WHERE chat_id = ? AND name = ?", (chat_id, name.lower()))
         return (True, row[0]) if row else (False, None)
@@ -271,8 +266,6 @@ class Database:
             "DELETE FROM rp_commands WHERE chat_id = ? AND name = ?", (chat_id, name.lower()))
         return rows > 0
 
-    # --- модерация и варны ---
-
     async def get_moderator_level(self, chat_id: int, user_id: int, creator_id: int) -> int:
         if creator_id and user_id == creator_id:
             return CREATOR_LEVEL
@@ -281,7 +274,6 @@ class Database:
         return row[0] if row else 0
 
     async def get_stored_moderator_level(self, chat_id: int, user_id: int) -> int:
-        """Уровень из базы БЕЗ привилегий суперпользователя — для показа статуса в профиле."""
         row = await self._fetchone(
             "SELECT level FROM moderators WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         return row[0] if row else 0
@@ -293,7 +285,6 @@ class Database:
         """, (chat_id, user_id, level))
 
     async def get_total_warns(self, chat_id: int, user_id: int) -> int:
-        """Постоянные варны + ещё не истёкшие временные."""
         row = await self._fetchone(
             "SELECT count FROM warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         permanent = row[0] if row else 0
@@ -304,7 +295,6 @@ class Database:
 
     async def add_temp_warn(self, chat_id: int, user_id: int, expires_at: int,
                             issued_by: int = 0, reason: str | None = None) -> int:
-        """Выдаёт варн до expires_at. Возвращает число активных варнов после выдачи."""
         await self._exec("""
             INSERT INTO temp_warns (chat_id, user_id, expires_at, issued_at, issued_by, reason)
             VALUES (?, ?, ?, ?, ?, ?)
@@ -312,10 +302,31 @@ class Database:
         return await self.get_total_warns(chat_id, user_id)
 
     async def get_last_warn_time(self, chat_id: int, user_id: int) -> int | None:
-        """Когда пользователю в последний раз выдавали варн (None — не выдавали / время неизвестно)."""
         row = await self._fetchone(
             "SELECT MAX(issued_at) FROM temp_warns WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
         return row[0] if row and row[0] else None
+
+    async def get_warned_users(self, chat_id: int):
+        """Возвращает список пользователей, у которых есть активные варны."""
+        rows = await self._fetchall("""
+            SELECT DISTINCT user_id FROM temp_warns
+            WHERE chat_id = ? AND expires_at > ?
+        """, (chat_id, int(time.time())))
+        warned_ids = {r[0] for r in rows}
+        perm_rows = await self._fetchall("""
+            SELECT user_id FROM warns WHERE chat_id = ? AND count > 0
+        """, (chat_id,))
+        for r in perm_rows:
+            warned_ids.add(r[0])
+        return list(warned_ids)
+
+    async def get_user_warn_details(self, chat_id: int, user_id: int):
+        """Возвращает список деталей активных варнов пользователя."""
+        return await self._fetchall_dict("""
+            SELECT issued_at, expires_at, issued_by, reason FROM temp_warns
+            WHERE chat_id = ? AND user_id = ? AND expires_at > ?
+            ORDER BY issued_at DESC
+        """, (chat_id, user_id, int(time.time())))
 
     async def decrease_warn(self, chat_id: int, user_id: int, amount: int) -> int:
         row = await self._fetchone(
@@ -344,8 +355,6 @@ class Database:
     async def cleanup_expired_warns(self):
         await self._exec("DELETE FROM temp_warns WHERE expires_at <= ?", (int(time.time()),))
 
-    # --- служебные значения ---
-
     async def get_meta(self, key: str) -> str | None:
         row = await self._fetchone("SELECT value FROM meta WHERE key = ?", (key,))
         return row[0] if row else None
@@ -355,8 +364,6 @@ class Database:
             INSERT INTO meta (key, value) VALUES (?, ?)
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """, (key, value))
-
-    # --- вступление / выход участников ---
 
     async def record_join(self, chat_id: int, user_id: int, username, first_name, ts: int):
         await self._exec("""
@@ -373,15 +380,11 @@ class Database:
         await self._exec(
             "UPDATE member_stats SET is_member = 0 WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
 
-    # --- недельная норма ---
-
     async def get_group_chat_ids(self) -> list[int]:
         rows = await self._fetchall("SELECT DISTINCT chat_id FROM member_stats WHERE chat_id < 0")
         return [r[0] for r in rows]
 
     async def get_quota_candidates(self, chat_id: int, quota: int, grace_cutoff: int):
-        """Участники под нормой. Пропускаются: вступившие после grace_cutoff (льготная неделя)
-        и те, кто сейчас на ресте."""
         return await self._fetchall_dict("""
             SELECT user_id, username, first_name, rp_name, week_count, joined_at, first_seen
             FROM member_stats
@@ -424,8 +427,6 @@ class Database:
     async def delete_report(self, report_id: int):
         await self._exec("DELETE FROM quota_reports WHERE id = ?", (report_id,))
 
-    # --- настройки чата ---
-
     async def get_weekly_quota(self, chat_id: int, default: int) -> int:
         row = await self._fetchone("SELECT weekly_quota FROM chat_settings WHERE chat_id = ?", (chat_id,))
         return row[0] if row and row[0] else default
@@ -436,13 +437,12 @@ class Database:
             ON CONFLICT(chat_id) DO UPDATE SET weekly_quota = excluded.weekly_quota
         """, (chat_id, quota))
 
-    # --- профиль и неактив ---
-
     async def get_profile(self, chat_id: int, user_id: int):
         return await self._fetchone_dict("""
             SELECT rp_name, tag, first_name, username,
                    COALESCE(week_count, 0) AS week_count, message_count,
-                   joined_at, first_seen, COALESCE(reputation, 0) AS reputation
+                   joined_at, first_seen, COALESCE(reputation, 0) AS reputation,
+                   COALESCE(cassettes, 0) AS cassettes
             FROM member_stats WHERE chat_id = ? AND user_id = ?
         """, (chat_id, user_id))
 
@@ -454,7 +454,6 @@ class Database:
         return row[0] if row else 0
 
     async def get_inactive_members(self, chat_id: int, quota: int, limit: int):
-        """Участники, не набравшие норму за текущую неделю (меньше всех сообщений — первыми)."""
         return await self._fetchall_dict("""
             SELECT user_id, rp_name, tag, first_name, username, COALESCE(week_count, 0) AS week_count,
                    COALESCE(rest_until, 0) AS rest_until
@@ -464,8 +463,6 @@ class Database:
             LIMIT ?
         """, (chat_id, quota, limit))
 
-    # --- рест (отдых от нормы) ---
-
     async def set_rest(self, chat_id: int, user_id: int, until: int):
         await self._exec("""
             INSERT INTO member_stats (chat_id, user_id, rest_until, first_seen) VALUES (?, ?, ?, ?)
@@ -473,9 +470,65 @@ class Database:
         """, (chat_id, user_id, until, int(time.time())))
 
     async def clear_rest(self, chat_id: int, user_id: int) -> bool:
-        """True, если рест действительно действовал и был снят."""
         rows = await self._exec("""
             UPDATE member_stats SET rest_until = NULL
             WHERE chat_id = ? AND user_id = ? AND COALESCE(rest_until, 0) > ?
         """, (chat_id, user_id, int(time.time())))
         return rows > 0
+
+    # --- Новые методы для Кассет, Репутации и Триггеров ---
+
+    async def add_cassettes(self, chat_id: int, user_id: int, amount: int):
+        await self._exec("""
+            INSERT INTO member_stats (chat_id, user_id, cassettes, first_seen) VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET cassettes = COALESCE(cassettes, 0) + ?
+        """, (chat_id, user_id, max(0, amount), int(time.time()), amount))
+
+    async def get_cassettes(self, chat_id: int, user_id: int) -> int:
+        row = await self._fetchone("SELECT COALESCE(cassettes, 0) FROM member_stats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        return row[0] if row else 0
+
+    async def set_reputation(self, chat_id: int, user_id: int, delta: int):
+        await self._exec("""
+            INSERT INTO member_stats (chat_id, user_id, reputation, first_seen) VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET reputation = COALESCE(reputation, 0) + ?
+        """, (chat_id, user_id, delta, int(time.time()), delta))
+
+    async def get_daily_reward(self, chat_id: int) -> str | None:
+        row = await self._fetchone("SELECT daily_reward FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        return row[0] if row else None
+
+    async def set_daily_reward(self, chat_id: int, val: str):
+        await self._exec("""
+            INSERT INTO chat_settings (chat_id, daily_reward) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET daily_reward = excluded.daily_reward
+        """, (chat_id, val))
+
+    async def get_rest_price(self, chat_id: int) -> int:
+        row = await self._fetchone("SELECT COALESCE(rest_price, 1) FROM chat_settings WHERE chat_id = ?", (chat_id,))
+        return row[0] if row and row[0] else 1
+
+    async def set_rest_price(self, chat_id: int, price: int):
+        await self._exec("""
+            INSERT INTO chat_settings (chat_id, rest_price) VALUES (?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET rest_price = excluded.rest_price
+        """, (chat_id, price))
+
+    async def add_trigger(self, chat_id: int, t_type: str, keyword: str, action: str):
+        await self._exec("""
+            INSERT INTO triggers (chat_id, type, keyword, action) VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, type, keyword) DO UPDATE SET action = excluded.action
+        """, (chat_id, t_type, keyword.lower(), action))
+
+    async def get_triggers(self, chat_id: int, t_type: str):
+        return await self._fetchall("SELECT keyword, action FROM triggers WHERE chat_id = ? AND type = ?", (chat_id, t_type))
+
+    async def get_last_daily_claim(self, chat_id: int, user_id: int) -> str | None:
+        row = await self._fetchone("SELECT last_daily_claim FROM member_stats WHERE chat_id = ? AND user_id = ?", (chat_id, user_id))
+        return row[0] if row else None
+
+    async def set_last_daily_claim(self, chat_id: int, user_id: int, date_str: str):
+        await self._exec("""
+            INSERT INTO member_stats (chat_id, user_id, last_daily_claim, first_seen) VALUES (?, ?, ?, ?)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET last_daily_claim = excluded.last_daily_claim
+        """, (chat_id, user_id, date_str, int(time.time())))
